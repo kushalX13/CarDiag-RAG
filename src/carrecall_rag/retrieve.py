@@ -107,8 +107,8 @@ def load_faiss_indexes(cache_dir: str = "data/indexes/") -> dict:
     """
     result = {
         "global": None,
-        "pools": {},  # (make_norm, model_key) -> {index, mapping, docs}
-        "makes": {},  # make_norm -> {index, mapping, docs}
+        "pools": {},  # pool_FORD_f150 -> {index, mapping, docs}
+        "makes": {},  # make_FORD -> {index, mapping, docs}
     }
 
     if not os.path.isdir(cache_dir):
@@ -131,7 +131,7 @@ def load_faiss_indexes(cache_dir: str = "data/indexes/") -> dict:
     if g:
         result["global"] = {"index": g[0], "mapping": g[1], "docs": g[2]}
 
-    # Pools and makes
+    # Pools and makes (use string keys matching build_faiss_indexes: pool_MAKE_modelkey, make_MAKE)
     for fname in os.listdir(cache_dir):
         if not fname.endswith(".faiss"):
             continue
@@ -142,19 +142,50 @@ def load_faiss_indexes(cache_dir: str = "data/indexes/") -> dict:
         if not g:
             continue
         if name.startswith("pool_"):
-            parts = name[5:].rsplit("_", 1)  # pool_MAKE_modelkey
-            if len(parts) == 2:
-                make_norm, model_key = parts[0].replace("_", " "), parts[1]
-                result["pools"][(make_norm, model_key)] = {
-                    "index": g[0],
-                    "mapping": g[1],
-                    "docs": g[2],
-                }
+            result["pools"][name] = {"index": g[0], "mapping": g[1], "docs": g[2]}
         elif name.startswith("make_"):
-            make_norm = name[5:].replace("_", " ")
-            result["makes"][make_norm] = {"index": g[0], "mapping": g[1], "docs": g[2]}
+            result["makes"][name] = {"index": g[0], "mapping": g[1], "docs": g[2]}
 
     return result
+
+
+def select_index(
+    make_norm: str,
+    model_key: str,
+    pools: dict,
+    make_only: dict,
+    global_entry: dict | None,
+    min_pool_docs: int = 50,
+) -> tuple[dict, str, str]:
+    """
+    Select which index to use for search. Returns (entry, index_name, index_type).
+
+    Selection:
+    1) pool_key exists AND pools[pool_key].index.ntotal >= min_pool_docs -> pool
+    2) make_key exists AND make_only[make_key].index.ntotal >= min_pool_docs -> make
+    3) else -> global
+
+    model_key must be lower alphanumeric (e.g. "F-150" -> "f150").
+    """
+    pool_key = f"pool_{make_norm}_{model_key}".replace("/", "_").replace(" ", "_")
+    make_key = f"make_{make_norm}".replace("/", "_").replace(" ", "_")
+
+    if pool_key in pools:
+        entry = pools[pool_key]
+        ntotal = entry["index"].ntotal
+        if ntotal >= min_pool_docs:
+            return entry, pool_key, "pool"
+
+    if make_key in make_only:
+        entry = make_only[make_key]
+        ntotal = entry["index"].ntotal
+        if ntotal >= min_pool_docs:
+            return entry, make_key, "make"
+
+    if global_entry:
+        return global_entry, "global", "global"
+
+    return None, None, None
 
 
 def search(
@@ -168,52 +199,33 @@ def search(
     min_pool_docs: int = 50,
 ) -> list[tuple[dict, float]]:
     """
-    Search for relevant docs. STRICT index selection:
-    - (make_norm, model_key) pool if exists and has >= min_pool_docs: only search that pool (no fallback)
-    - else (pool has < min_pool_docs or missing): make-only fallback
-    - else global
-
+    Search for relevant docs. Uses select_index for STRICT index selection.
     Returns list of (doc, score) sorted by score desc.
     """
-    # Ensure normalization matches index keys (same as corpus/build_faiss_indexes)
+    # Ensure model_key is lower alphanumeric (e.g. "F-150" -> "f150") to match saved indexes
     make_norm = normalize_make(make_norm) if make_norm else ""
     model_key = compute_model_key(model_key) if model_key else ""
 
-    pool_key = (make_norm, model_key)
-    entry = None
-    index_name = "global"
-
     if use_pool_indexes:
-        pool_entry = indexes.get("pools", {}).get(pool_key)
-        if pool_entry:
-            n_docs = len(pool_entry["docs"])
-            if n_docs >= min_pool_docs:
-                # Model-specific pool exists and is large enough: use it ONLY, no fallback
-                entry = pool_entry
-                index_name = f"pool_{make_norm}_{model_key}"
-            else:
-                # Pool exists but too small: fallback to make-only
-                make_entry = indexes.get("makes", {}).get(make_norm)
-                if make_entry:
-                    entry = make_entry
-                    index_name = f"make_{make_norm}"
-        else:
-            # No pool: fallback to make-only
-            make_entry = indexes.get("makes", {}).get(make_norm)
-            if make_entry:
-                entry = make_entry
-                index_name = f"make_{make_norm}"
+        entry, index_name, index_type = select_index(
+            make_norm,
+            model_key,
+            indexes.get("pools", {}),
+            indexes.get("makes", {}),
+            indexes.get("global"),
+            min_pool_docs=min_pool_docs,
+        )
+    else:
+        entry = indexes.get("global")
+        index_name = "global"
+        index_type = "global"
 
     if entry is None:
-        entry = indexes.get("global")
-        if entry is None:
-            return []
-        index_name = "global"
+        return []
 
-    n_docs = len(entry["docs"])
-    index_msg = f"{index_name} ({n_docs} docs)"
-    logger.info("Using index: %s", index_msg)
-    print(f"Selected index: {index_msg}")
+    ntotal = entry["index"].ntotal
+    logger.info("Selected index: %s (%d docs) [%s]", index_name, ntotal, index_type)
+    print(f"Selected index: {index_name} ({ntotal} docs) [{index_type}]")
 
     faiss_index = entry["index"]
     docs = entry["docs"]
