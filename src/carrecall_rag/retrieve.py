@@ -106,54 +106,53 @@ def load_faiss_indexes(cache_dir: str = "data/indexes/") -> dict:
     Returns dict with keys: "global", "pools", "makes".
     Each index entry has: index (faiss.Index), mapping (list of {doc_id, campaign_number}), docs (full doc list).
     """
-    cache_path = Path(cache_dir)
-    logger.info(f"Loading indexes from: {cache_dir} (abs: {cache_path.resolve()})")
+    cache_path = Path(cache_dir).resolve()
+    logger.info(f"Loading indexes from: {cache_dir} (abs: {cache_path})")
     logger.info(f"Exists? {cache_path.exists()}  | files: {len(list(cache_path.glob('*'))) if cache_path.exists() else 0}")
     logger.info(f"Sample files: {[p.name for p in list(cache_path.glob('*'))[:20]] if cache_path.exists() else []}")
 
-    result = {
-        "global": None,
-        "pools": {},  # pool_FORD_f150 -> {index, mapping, docs}
-        "makes": {},  # make_FORD -> {index, mapping, docs}
-    }
+    indexes = {}
+    mappings = {}
 
-    if not os.path.isdir(cache_dir):
-        return result
+    if not cache_path.exists() or not cache_path.is_dir():
+        logger.warning("Cache dir missing or not a directory: %s", cache_path)
+        return {"global": None, "pools": {}, "makes": {}}
 
-    def _load_one(name: str) -> tuple | None:
-        idx_path = os.path.join(cache_dir, f"{name}.faiss")
-        map_path = os.path.join(cache_dir, f"{name}_mapping.json")
-        if not os.path.exists(idx_path) or not os.path.exists(map_path):
-            return None
-        index = faiss.read_index(idx_path)
+    faiss_files = list(cache_path.glob("*.faiss"))
+    logger.info(f"Found %d .faiss files", len(faiss_files))
+
+    for faiss_path in faiss_files:
+        key = faiss_path.stem  # e.g. "pool_FORD_f150", "global"
+        map_path = cache_path / f"{key}_mapping.json"
+
+        if not map_path.exists():
+            logger.warning("Missing mapping for %s: %s", key, map_path)
+            continue
+
+        index = faiss.read_index(str(faiss_path))
         with open(map_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        mapping = data.get("mapping", [])
-        docs = data.get("docs", [])
-        return index, mapping, docs
+            mapping_data = json.load(f)
 
-    # Global
-    g = _load_one("global")
-    if g:
-        result["global"] = {"index": g[0], "mapping": g[1], "docs": g[2]}
+        indexes[key] = index
+        mappings[key] = mapping_data
 
-    # Pools and makes (use string keys matching build_faiss_indexes: pool_MAKE_modelkey, make_MAKE)
-    for fname in os.listdir(cache_dir):
-        if not fname.endswith(".faiss"):
-            continue
-        name = fname[:-5]  # strip .faiss
-        if name == "global":
-            continue
-        g = _load_one(name)
-        if not g:
-            continue
-        if name.startswith("pool_"):
-            result["pools"][name] = {"index": g[0], "mapping": g[1], "docs": g[2]}
-        elif name.startswith("make_"):
-            result["makes"][name] = {"index": g[0], "mapping": g[1], "docs": g[2]}
+    logger.info(f"Loaded index keys: {sorted(indexes.keys())}")
 
-    all_index_keys = sorted(result["pools"].keys()) + sorted(result["makes"].keys())
-    logger.info("Loaded indexes: %s", all_index_keys[:30])
+    # Build result structure for select_index/search (pools, makes, global)
+    result = {"global": None, "pools": {}, "makes": {}}
+    for key in indexes:
+        mapping_data = mappings[key]
+        entry = {
+            "index": indexes[key],
+            "mapping": mapping_data.get("mapping", []),
+            "docs": mapping_data.get("docs", []),
+        }
+        if key == "global":
+            result["global"] = entry
+        elif key.startswith("pool_"):
+            result["pools"][key] = entry
+        elif key.startswith("make_"):
+            result["makes"][key] = entry
 
     return result
 
