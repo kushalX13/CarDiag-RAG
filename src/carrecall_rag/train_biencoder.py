@@ -51,7 +51,7 @@ class TriplesDataset(Dataset):
         for t in triples:
             query = t.get("query_text", "")
             pos = t.get("pos", {})
-            negs = t.get("negs", [])[:4]  # up to 4 negs
+            negs = t.get("negs", [])[:8]  # up to 8 negs
             pos_text = pos.get("text", "") if isinstance(pos, dict) else ""
             passages = [pos_text]
             for n in negs:

@@ -21,7 +21,7 @@ MIN_POOL_SIZE = 50
 TOP_K = 20
 MIN_HITS = 2
 GAP_FACTOR = 1.15
-MAX_NEGS = 4
+MAX_NEGS = 8
 TRAIN_RATIO = 0.95  # 95% train, 5% val
 
 
