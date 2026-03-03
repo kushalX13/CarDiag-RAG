@@ -4,6 +4,7 @@ import argparse
 import json
 import logging
 import os
+from collections import defaultdict
 
 import numpy as np
 import torch
@@ -14,6 +15,8 @@ from .config import DATA_DIR, PROCESSED_DIR
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
+
+MIN_POOL_SIZE = 50
 
 
 def get_device() -> str:
@@ -172,6 +175,127 @@ def eval_full_corpus(
     return metrics
 
 
+def eval_pool_filtered(
+    model: SentenceTransformer,
+    val_triples: list[dict],
+    corpus: list[dict],
+    k_values: list[int],
+    device: str = "cpu",
+    batch_size: int = 128,
+) -> dict:
+    """Pool-filtered eval: group corpus by (make_norm, model_key), build FAISS per pool, search per query."""
+    try:
+        import faiss
+    except ImportError:
+        logger.warning("faiss-cpu not installed; skipping pool-filtered eval")
+        return {}
+
+    # Group corpus by (make_norm, model_key)
+    pools_make_model: dict[tuple[str, str], list[tuple[str, str]]] = defaultdict(list)
+    pools_make: dict[str, list[tuple[str, str]]] = defaultdict(list)
+    for d in corpus:
+        doc_id = d.get("doc_id")
+        if doc_id is None:
+            continue
+        make_norm = d.get("make_norm") or ""
+        model_key = d.get("model_key") or ""
+        text = d.get("text", "")
+        pools_make_model[(make_norm, model_key)].append((doc_id, text))
+        pools_make[make_norm].append((doc_id, text))
+
+    # Build FAISS index per pool
+    pool_indexes: dict[tuple[str, str] | tuple[str], tuple] = {}
+
+    def _build_index(doc_ids: list[str], texts: list[str]) -> tuple:
+        if not texts:
+            return None
+        embs = model.encode(
+            texts,
+            convert_to_numpy=True,
+            show_progress_bar=False,
+            device=device,
+            batch_size=batch_size,
+        )
+        embs = np.ascontiguousarray(embs.astype(np.float32))
+        faiss.normalize_L2(embs)
+        d = embs.shape[1]
+        index = faiss.IndexFlatIP(d)
+        index.add(embs)
+        return (index, doc_ids)
+
+    logger.info("Building FAISS indexes for %d (make,model) pools and make-only fallbacks...", len(pools_make_model))
+    # Build indexes for (make, model) pools
+    for (make, model), items in pools_make_model.items():
+        if items:
+            doc_ids, texts = zip(*items)
+            pool_indexes[(make, model)] = _build_index(list(doc_ids), list(texts))
+    # Build indexes for make-only pools (for fallback when make+model pool < 50)
+    for make, items in pools_make.items():
+        key = (make,)
+        if key not in pool_indexes and items:
+            doc_ids, texts = zip(*items)
+            pool_indexes[key] = _build_index(list(doc_ids), list(texts))
+
+    # Extract queries with make_norm, model_key, query_text, pos_doc_id
+    queries_data = []
+    for t in val_triples:
+        query_text = t.get("query_text", "")
+        make_norm = t.get("make_norm") or ""
+        model_key = t.get("model_key") or ""
+        pos = t.get("pos", {})
+        pos_doc_id = pos.get("doc_id", "") if isinstance(pos, dict) else ""
+        if query_text and pos_doc_id:
+            queries_data.append({
+                "query_text": query_text,
+                "make_norm": make_norm,
+                "model_key": model_key,
+                "pos_doc_id": pos_doc_id,
+            })
+
+    max_k = max(k_values)
+    recalls = {k: [] for k in k_values}
+
+    # Encode all queries
+    query_texts = [q["query_text"] for q in queries_data]
+    query_embs = model.encode(
+        query_texts,
+        convert_to_numpy=True,
+        show_progress_bar=True,
+        device=device,
+        batch_size=batch_size,
+    )
+    query_embs = np.ascontiguousarray(query_embs.astype(np.float32))
+    faiss.normalize_L2(query_embs)
+
+    for i, q in enumerate(queries_data):
+        make_norm = q["make_norm"]
+        model_key = q["model_key"]
+        pos_doc_id = q["pos_doc_id"]
+        pool_key = (make_norm, model_key)
+        # If pool size < 50, fallback to make_norm-only pool
+        if pool_key in pools_make_model and len(pools_make_model[pool_key]) >= MIN_POOL_SIZE:
+            index_key = pool_key
+        else:
+            index_key = (make_norm,)
+        if index_key not in pool_indexes or pool_indexes[index_key] is None:
+            for k in k_values:
+                recalls[k].append(False)
+            continue
+        index, doc_ids = pool_indexes[index_key]
+        q_emb = query_embs[i : i + 1]
+        _, indices = index.search(q_emb, min(max_k, len(doc_ids)))
+        top_doc_ids = [doc_ids[idx] for idx in indices[0] if idx >= 0]
+        for k in k_values:
+            hit = pos_doc_id in top_doc_ids[:k]
+            recalls[k].append(hit)
+
+    metrics = {}
+    for k in k_values:
+        r = np.mean(recalls[k]) if recalls[k] else 0.0
+        metrics[f"recall_pool_filtered@{k}"] = float(r)
+    return metrics
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Evaluate bi-encoder retriever")
     parser.add_argument(
@@ -222,6 +346,11 @@ def main() -> None:
         default=128,
         help="Batch size for encoding (full corpus eval)",
     )
+    parser.add_argument(
+        "--no-pool-filter",
+        action="store_true",
+        help="Disable pool filtering (default: pool-filter enabled when --full-corpus)",
+    )
     args = parser.parse_args()
 
     if not os.path.exists(args.model_dir):
@@ -260,9 +389,23 @@ def main() -> None:
             for k, v in full.items():
                 logger.info("%s: %.4f", k, v)
 
+            # Pool-filtered eval (default when --full-corpus, disable with --no-pool-filter)
+            pool_filter = not args.no_pool_filter
+            if pool_filter:
+                pool_metrics = eval_pool_filtered(
+                    model, val_triples, corpus, args.k, device=device, batch_size=args.batch_size
+                )
+                metrics.update(pool_metrics)
+                for k, v in pool_metrics.items():
+                    logger.info("%s: %.4f", k, v)
+
             # Save full corpus metrics to dedicated file
             os.makedirs(os.path.dirname(METRICS_FULL_CORPUS_PATH) or ".", exist_ok=True)
-            full_metrics = {k: v for k, v in metrics.items() if k.startswith("recall_full_corpus")}
+            full_metrics = {
+                k: v
+                for k, v in metrics.items()
+                if k.startswith("recall_full_corpus") or k.startswith("recall_pool_filtered")
+            }
             with open(METRICS_FULL_CORPUS_PATH, "w", encoding="utf-8") as f:
                 json.dump(full_metrics, f, indent=2)
             logger.info("Saved full corpus metrics to %s", METRICS_FULL_CORPUS_PATH)
