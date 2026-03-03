@@ -80,12 +80,14 @@ def train_epoch(
     optimizer: torch.optim.Optimizer,
     device: torch.device,
     use_amp: bool,
+    grad_accum_steps: int = 1,
 ) -> float:
     """Run one training epoch. Returns average loss."""
     model.train()
     total_loss = 0.0
     n_batches = 0
     scaler = torch.amp.GradScaler("cuda") if use_amp else None
+    optimizer.zero_grad()
 
     for queries, passages_list in tqdm(dataloader, desc="Training"):
         # Per-query: (query, [pos, neg1, neg2, ...]), label 0 = pos at index 0
@@ -135,19 +137,31 @@ def train_epoch(
         logits = torch.stack(padded_logits)  # (batch, max_size)
 
         labels_t = torch.zeros(len(queries), dtype=torch.long, device=device)
-        loss = torch.nn.functional.cross_entropy(logits, labels_t)
+        loss = torch.nn.functional.cross_entropy(logits, labels_t) / grad_accum_steps
 
-        optimizer.zero_grad()
         if use_amp and scaler is not None:
             scaler.scale(loss).backward()
+        else:
+            loss.backward()
+
+        total_loss += loss.item() * grad_accum_steps  # report unscaled loss
+        n_batches += 1
+
+        if n_batches % grad_accum_steps == 0:
+            if use_amp and scaler is not None:
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                optimizer.step()
+            optimizer.zero_grad()
+
+    if n_batches % grad_accum_steps != 0:
+        if use_amp and scaler is not None:
             scaler.step(optimizer)
             scaler.update()
         else:
-            loss.backward()
             optimizer.step()
-
-        total_loss += loss.item()
-        n_batches += 1
+        optimizer.zero_grad()
 
     return total_loss / max(n_batches, 1)
 
@@ -181,6 +195,12 @@ def main() -> None:
         type=str,
         default=None,
         help="Where to save trained model (default: data/models/biencoder for MiniLM, data/models/biencoder_mpnet for MPNet)",
+    )
+    parser.add_argument(
+        "--grad-accum-steps",
+        type=int,
+        default=1,
+        help="Accumulate gradients for N steps before optimizer.step(); scale loss by 1/N",
     )
     args = parser.parse_args()
 
@@ -224,7 +244,10 @@ def main() -> None:
     os.makedirs(output_dir, exist_ok=True)
 
     for epoch in range(args.epochs):
-        loss = train_epoch(model, dataloader, optimizer, device, use_amp)
+        loss = train_epoch(
+            model, dataloader, optimizer, device, use_amp,
+            grad_accum_steps=args.grad_accum_steps,
+        )
         logger.info("Epoch %d: loss = %.4f", epoch + 1, loss)
 
     model.save(output_dir)
@@ -232,6 +255,7 @@ def main() -> None:
         "base_model": args.model,
         "epochs": args.epochs,
         "batch_size": args.batch_size,
+        "grad_accum_steps": args.grad_accum_steps,
         "lr": args.lr,
         "seed": args.seed,
     }
