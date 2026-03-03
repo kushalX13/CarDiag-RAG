@@ -60,7 +60,8 @@ def _extract_tokens(query: str) -> list[str]:
 def _keyword_score(doc_text: str, query_tokens: list[str], phrase_boosts: list[str]) -> float:
     """
     Base keyword_score = (#token hits in doc text) / sqrt(len(tokens)+1)
-    + 3 per phrase hit. Cap at 10.
+    + 5 per phrase hit. Bonus +2 if token_hit_rate > 0.4 or phrase_count >= 1.
+    Cap at 10.
     """
     if not doc_text:
         return 0.0
@@ -70,8 +71,12 @@ def _keyword_score(doc_text: str, query_tokens: list[str], phrase_boosts: list[s
     token_hits = sum(1 for t in query_tokens if t in doc_tokens)
     base = token_hits / math.sqrt(len(query_tokens) + 1)
 
-    phrase_hits = sum(3 for p in phrase_boosts if _normalize_text(p) in norm_doc)
-    score = base + phrase_hits
+    phrase_hits = sum(5 for p in phrase_boosts if _normalize_text(p) in norm_doc)
+    phrase_count = sum(1 for p in phrase_boosts if _normalize_text(p) in norm_doc)
+    token_hit_rate = token_hits / len(query_tokens) if query_tokens else 0.0
+
+    symptom_bonus = 2.0 if (token_hit_rate > 0.4 or phrase_count >= 1) else 0.0
+    score = base + phrase_hits + symptom_bonus
     return min(score, 10.0)
 
 
@@ -175,7 +180,7 @@ def main() -> None:
     parser.add_argument(
         "--alpha",
         type=float,
-        default=0.15,
+        default=0.35,
         help="Weight for keyword score in final_score = dense_score + alpha * keyword_score",
     )
     parser.add_argument(
