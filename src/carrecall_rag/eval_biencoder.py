@@ -347,9 +347,14 @@ def main() -> None:
         help="Batch size for encoding (full corpus eval)",
     )
     parser.add_argument(
+        "--pool-filter",
+        action="store_true",
+        help="Enable pool filtering (default when --full-corpus)",
+    )
+    parser.add_argument(
         "--no-pool-filter",
         action="store_true",
-        help="Disable pool filtering (default: pool-filter enabled when --full-corpus)",
+        help="Disable pool filtering when --full-corpus",
     )
     args = parser.parse_args()
 
