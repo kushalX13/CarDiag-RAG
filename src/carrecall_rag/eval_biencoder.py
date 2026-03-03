@@ -225,10 +225,10 @@ def eval_pool_filtered(
 
     logger.info("Building FAISS indexes for %d (make,model) pools and make-only fallbacks...", len(pools_make_model))
     # Build indexes for (make, model) pools
-    for (make, model), items in pools_make_model.items():
+    for (make, model_key), items in pools_make_model.items():
         if items:
             doc_ids, texts = zip(*items)
-            pool_indexes[(make, model)] = _build_index(list(doc_ids), list(texts))
+            pool_indexes[(make, model_key)] = _build_index(list(doc_ids), list(texts))
     # Build indexes for make-only pools (for fallback when make+model pool < 50)
     for make, items in pools_make.items():
         key = (make,)
