@@ -150,3 +150,7 @@ def main() -> None:
             print(f"Suggested recall match: Campaign {camp['campaign_number']} - {best_text}...")
 
     print()
+
+
+if __name__ == "__main__":
+    main()
