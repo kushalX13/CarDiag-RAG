@@ -28,6 +28,7 @@ BIENCODER_MODEL_DIR = os.path.join(DATA_DIR, "models", "biencoder")
 VAL_TRIPLES_PATH = os.path.join(PROCESSED_DIR, "val_triples.jsonl")
 CORPUS_MERGED_PATH = os.path.join(PROCESSED_DIR, "corpus_merged.jsonl")
 METRICS_PATH = os.path.join(PROCESSED_DIR, "biencoder_metrics.json")
+METRICS_FULL_CORPUS_PATH = os.path.join(PROCESSED_DIR, "biencoder_metrics_full_corpus.json")
 
 
 def load_jsonl(path: str) -> list[dict]:
@@ -95,6 +96,7 @@ def eval_full_corpus(
     corpus: list[dict],
     k_values: list[int],
     device: str = "cpu",
+    batch_size: int = 128,
 ) -> dict:
     """Encode full corpus, build FAISS index, retrieve top-k per query, check if pos in top-k."""
     try:
@@ -103,36 +105,62 @@ def eval_full_corpus(
         logger.warning("faiss-cpu not installed; skipping full corpus eval")
         return {}
 
-    # Build doc_id -> text mapping
-    doc_id_to_text = {d["doc_id"]: d.get("text", "") for d in corpus if d.get("doc_id")}
-    doc_ids = list(doc_id_to_text.keys())
-    texts = [doc_id_to_text[did] for did in doc_ids]
+    # Extract query_id, query_text, pos.doc_id from val_triples
+    queries_data = []
+    for t in val_triples:
+        query_id = t.get("query_id", "")
+        query_text = t.get("query_text", "")
+        pos = t.get("pos", {})
+        pos_doc_id = pos.get("doc_id", "") if isinstance(pos, dict) else ""
+        if query_text and pos_doc_id:
+            queries_data.append({"query_id": query_id, "query_text": query_text, "pos_doc_id": pos_doc_id})
 
-    logger.info("Encoding %d corpus passages...", len(texts))
-    embs = model.encode(texts, convert_to_numpy=True, show_progress_bar=True, device=device)
-    embs = np.ascontiguousarray(embs.astype(np.float32))
+    # Build doc_ids and passage_text aligned arrays from corpus
+    doc_ids = []
+    passage_texts = []
+    for d in corpus:
+        if d.get("doc_id") is not None:
+            doc_ids.append(d["doc_id"])
+            passage_texts.append(d.get("text", ""))
 
-    d = embs.shape[1]
-    index = faiss.IndexFlatIP(d)  # inner product = dot product for normalized vectors
-    faiss.normalize_L2(embs)  # normalize for cosine ~ dot product
-    index.add(embs)
+    logger.info("Encoding %d corpus passages in batches of %d...", len(passage_texts), batch_size)
+    passage_embs = model.encode(
+        passage_texts,
+        convert_to_numpy=True,
+        show_progress_bar=True,
+        device=device,
+        batch_size=batch_size,
+    )
+    passage_embs = np.ascontiguousarray(passage_embs.astype(np.float32))
+
+    # IndexFlatIP + L2 normalize = cosine similarity
+    d = passage_embs.shape[1]
+    index = faiss.IndexFlatIP(d)
+    faiss.normalize_L2(passage_embs)
+    index.add(passage_embs)
 
     max_k = max(k_values)
     recalls = {k: [] for k in k_values}
 
-    for t in tqdm(val_triples, desc="Full corpus eval"):
-        query = t.get("query_text", "")
-        pos = t.get("pos", {})
-        pos_doc_id = pos.get("doc_id", "") if isinstance(pos, dict) else ""
+    # Encode all queries in batches
+    query_texts = [q["query_text"] for q in queries_data]
+    logger.info("Encoding %d val queries in batches of %d...", len(query_texts), batch_size)
+    query_embs = model.encode(
+        query_texts,
+        convert_to_numpy=True,
+        show_progress_bar=True,
+        device=device,
+        batch_size=batch_size,
+    )
+    query_embs = np.ascontiguousarray(query_embs.astype(np.float32))
+    faiss.normalize_L2(query_embs)
 
-        if not query or not pos_doc_id:
-            continue
+    # Search for all queries
+    distances, indices = index.search(query_embs, max_k)
 
-        q_emb = model.encode([query], convert_to_numpy=True, device=device).astype(np.float32)
-        faiss.normalize_L2(q_emb)
-        distances, indices = index.search(q_emb, max_k)
-        top_doc_ids = [doc_ids[i] for i in indices[0]]
-
+    for i, q in enumerate(queries_data):
+        pos_doc_id = q["pos_doc_id"]
+        top_doc_ids = [doc_ids[idx] for idx in indices[i] if idx >= 0]
         for k in k_values:
             hit = pos_doc_id in top_doc_ids[:k]
             recalls[k].append(hit)
@@ -188,6 +216,12 @@ def main() -> None:
         default=None,
         help="If set, only evaluate on the first N val triples",
     )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=128,
+        help="Batch size for encoding (full corpus eval)",
+    )
     args = parser.parse_args()
 
     if not os.path.exists(args.model_dir):
@@ -219,10 +253,19 @@ def main() -> None:
             logger.warning("Corpus not found at %s; skipping full corpus eval", args.corpus_path)
         else:
             corpus = load_jsonl(args.corpus_path)
-            full = eval_full_corpus(model, val_triples, corpus, args.k, device=device)
+            full = eval_full_corpus(
+                model, val_triples, corpus, args.k, device=device, batch_size=args.batch_size
+            )
             metrics.update(full)
             for k, v in full.items():
                 logger.info("%s: %.4f", k, v)
+
+            # Save full corpus metrics to dedicated file
+            os.makedirs(os.path.dirname(METRICS_FULL_CORPUS_PATH) or ".", exist_ok=True)
+            full_metrics = {k: v for k, v in metrics.items() if k.startswith("recall_full_corpus")}
+            with open(METRICS_FULL_CORPUS_PATH, "w", encoding="utf-8") as f:
+                json.dump(full_metrics, f, indent=2)
+            logger.info("Saved full corpus metrics to %s", METRICS_FULL_CORPUS_PATH)
 
     os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
     with open(args.output, "w", encoding="utf-8") as f:
