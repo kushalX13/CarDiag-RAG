@@ -75,8 +75,8 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    make_norm = normalize_make(args.make) if args.make else ""
-    model_key_val = model_key(args.model) if args.model else ""
+    make_norm = normalize_make(args.make) if args.make else ""  # "Ford" -> "FORD"
+    mkey = model_key(args.model) if args.model else ""  # "F-150" -> "f150"
 
     if args.query is not None:
         query_text = args.query
@@ -122,7 +122,7 @@ def main() -> None:
     results = search(
         search_query,
         make_norm,
-        model_key_val,
+        mkey,
         indexes,
         model,
         top_k=args.topk,
@@ -135,7 +135,7 @@ def main() -> None:
         sys.exit(0)
 
     # Aggregate by campaign (filter cross-make when user specified vehicle)
-    campaigns = aggregate_by_campaign(results, make_norm=make_norm or None)
+    campaigns = aggregate_by_campaign(results, make_norm=make_norm if make_norm else None)
 
     # Print top campaigns
     for i, camp in enumerate(campaigns[: args.topc]):

@@ -82,10 +82,10 @@ def build_faiss_indexes(
         model_key = doc.get("model_key") or ""
         pool_groups[(make_norm, model_key)].append(i)
 
-    for (make_norm, model_key), indices in pool_groups.items():
+    for (make_norm, mkey), indices in pool_groups.items():
         if len(indices) >= min_pool_docs:
-            safe_name = f"pool_{make_norm}_{model_key}".replace("/", "_").replace(" ", "_")
-            _save_index(safe_name, indices)
+            pool_key = f"pool_{make_norm}_{mkey}"
+            _save_index(pool_key, indices)
 
     # c) Make-only fallback indexes
     make_groups: dict[str, list[int]] = defaultdict(list)
@@ -95,8 +95,8 @@ def build_faiss_indexes(
             make_groups[make_norm].append(i)
 
     for make_norm, indices in make_groups.items():
-        safe_name = f"make_{make_norm}".replace("/", "_").replace(" ", "_")
-        _save_index(safe_name, indices)
+        make_key = f"make_{make_norm}"
+        _save_index(make_key, indices)
 
 
 def load_faiss_indexes(cache_dir: str = "data/indexes/") -> dict:
@@ -146,6 +146,9 @@ def load_faiss_indexes(cache_dir: str = "data/indexes/") -> dict:
         elif name.startswith("make_"):
             result["makes"][name] = {"index": g[0], "mapping": g[1], "docs": g[2]}
 
+    all_index_keys = sorted(result["pools"].keys()) + sorted(result["makes"].keys())
+    logger.info("Loaded indexes: %s", all_index_keys[:30])
+
     return result
 
 
@@ -167,8 +170,8 @@ def select_index(
 
     model_key must be lower alphanumeric (e.g. "F-150" -> "f150").
     """
-    pool_key = f"pool_{make_norm}_{model_key}".replace("/", "_").replace(" ", "_")
-    make_key = f"make_{make_norm}".replace("/", "_").replace(" ", "_")
+    pool_key = f"pool_{make_norm}_{model_key}"
+    make_key = f"make_{make_norm}"
 
     if pool_key in pools:
         entry = pools[pool_key]
@@ -202,7 +205,7 @@ def search(
     Search for relevant docs. Uses select_index for STRICT index selection.
     Returns list of (doc, score) sorted by score desc.
     """
-    # Ensure model_key is lower alphanumeric (e.g. "F-150" -> "f150") to match saved indexes
+    # Ensure normalization matches corpus/build: make_norm ("Ford"->"FORD"), model_key ("F-150"->"f150")
     make_norm = normalize_make(make_norm) if make_norm else ""
     model_key = compute_model_key(model_key) if model_key else ""
 
