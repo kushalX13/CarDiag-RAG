@@ -2,15 +2,14 @@
 
 import argparse
 import logging
-import math
 import os
-import re
 import sys
 from collections import defaultdict
 
 from sentence_transformers import SentenceTransformer
 
 from .config import DATA_DIR, PROCESSED_DIR
+from .rerank import rerank
 from .retrieve import (
     build_faiss_indexes,
     load_corpus,
@@ -25,59 +24,6 @@ logger = logging.getLogger(__name__)
 DEFAULT_MODEL_DIR = os.path.join(DATA_DIR, "models", "biencoder")
 DEFAULT_CORPUS_PATH = os.path.join(PROCESSED_DIR, "corpus_merged.jsonl")
 DEFAULT_CACHE_DIR = os.path.join(DATA_DIR, "indexes")
-
-# Stopwords for keyword extraction (small set)
-STOPWORDS = {"the", "and", "for", "are", "but", "not", "you", "all", "can", "had", "her", "was", "one", "our", "out", "has", "his", "how", "its", "may", "new", "now", "old", "see", "way", "who", "did", "get", "got", "let", "put", "say", "too", "use"}
-
-# Phrase boosts for common symptoms
-PHRASE_BOOSTS = [
-    "loss of power",
-    "engine stalls",
-    "stalls while driving",
-    "shuts off",
-    "won't start",
-    "hard shift",
-    "brake pedal",
-    "steering",
-]
-
-
-def _normalize_text(text: str) -> str:
-    """Lowercase, replace hyphens with spaces, collapse whitespace."""
-    if not text:
-        return ""
-    t = text.lower().replace("-", " ")
-    return " ".join(t.split())
-
-
-def _extract_tokens(query: str) -> list[str]:
-    """Split on non-alphanum, keep length>=3, drop stopwords."""
-    norm = _normalize_text(query)
-    tokens = re.findall(r"[a-z0-9]+", norm)
-    return [t for t in tokens if len(t) >= 3 and t not in STOPWORDS]
-
-
-def _keyword_score(doc_text: str, query_tokens: list[str], phrase_boosts: list[str]) -> float:
-    """
-    Base keyword_score = (#token hits in doc text) / sqrt(len(tokens)+1)
-    + 5 per phrase hit. Bonus +2 if token_hit_rate > 0.4 or phrase_count >= 1.
-    Cap at 10.
-    """
-    if not doc_text:
-        return 0.0
-    norm_doc = _normalize_text(doc_text)
-    doc_tokens = set(re.findall(r"[a-z0-9]+", norm_doc))
-
-    token_hits = sum(1 for t in query_tokens if t in doc_tokens)
-    base = token_hits / math.sqrt(len(query_tokens) + 1)
-
-    phrase_hits = sum(5 for p in phrase_boosts if _normalize_text(p) in norm_doc)
-    phrase_count = sum(1 for p in phrase_boosts if _normalize_text(p) in norm_doc)
-    token_hit_rate = token_hits / len(query_tokens) if query_tokens else 0.0
-
-    symptom_bonus = 2.0 if (token_hit_rate > 0.4 or phrase_count >= 1) else 0.0
-    score = base + phrase_hits + symptom_bonus
-    return min(score, 10.0)
 
 
 def _build_query_from_context(make: str, model: str, year: int | None, query_text: str) -> str:
@@ -100,9 +46,9 @@ def _aggregate_by_campaign_with_scores(
     make_norm: str | None,
 ) -> list[dict]:
     """
-    Group by campaign_number, use final_score for campaign_score.
-    Each result is (doc, final_score, dense_score, keyword_score).
-    Evidence includes dense_score and keyword_score.
+    Group by campaign_number, use combined_score for campaign_score.
+    Each result is (doc, combined, dense_score, kw_norm).
+    Evidence includes dense_score, keyword_score (kw_norm), combined.
     """
     if make_norm:
         results = [
@@ -111,27 +57,28 @@ def _aggregate_by_campaign_with_scores(
         ]
 
     by_campaign: dict[str, list[tuple[dict, float, float, float]]] = defaultdict(list)
-    for doc, final_score, dense_score, keyword_score in results:
+    for doc, combined, dense_score, kw_norm in results:
         cn = doc.get("campaign_number") or ""
         if not cn.strip():
             continue
-        by_campaign[cn].append((doc, final_score, dense_score, keyword_score))
+        by_campaign[cn].append((doc, combined, dense_score, kw_norm))
 
     campaign_results = []
     for cn, items in by_campaign.items():
-        final_scores = [s[1] for s in items]
-        campaign_score = sum(final_scores) + 0.2 * max(final_scores) + 0.5 * len(items)
+        combined_scores = [s[1] for s in items]
+        campaign_score = sum(combined_scores) + 0.2 * max(combined_scores) + 0.5 * len(items)
         best = max(items, key=lambda x: x[1])
-        best_doc, best_final, best_dense, best_kw = best
+        best_doc, best_combined, best_dense, best_kw = best
         sorted_items = sorted(items, key=lambda x: x[1], reverse=True)
         evidence_snippets = []
-        for doc, final_s, dense_s, kw_s in sorted_items[:2]:
+        for doc, combined_s, dense_s, kw_s in sorted_items[:2]:
             text = (doc.get("text") or "")[:280]
             evidence_snippets.append({
                 "doc_id": doc.get("doc_id", ""),
                 "snippet": text,
                 "dense_score": dense_s,
                 "keyword_score": kw_s,
+                "combined": combined_s,
             })
         campaign_results.append({
             "campaign_number": cn,
@@ -180,11 +127,23 @@ def main() -> None:
     parser.add_argument(
         "--alpha",
         type=float,
-        default=0.35,
-        help="Weight for keyword score in final_score = dense_score + alpha * keyword_score",
+        default=0.15,
+        help="Weight for keyword: combined = (1-alpha)*dense + alpha*kw_norm",
     )
     parser.add_argument(
-        "--no-keyword-rerank",
+        "--rerank-tokens",
+        type=int,
+        default=12,
+        help="Max query tokens for rerank",
+    )
+    parser.add_argument(
+        "--rerank-phrases",
+        type=int,
+        default=10,
+        help="Max phrases for rerank",
+    )
+    parser.add_argument(
+        "--no-rerank",
         action="store_true",
         help="Disable keyword reranking",
     )
@@ -249,23 +208,21 @@ def main() -> None:
         logger.info("No results found.")
         sys.exit(0)
 
-    # Keyword rerank: compute keyword_score, final_score, re-rank
-    use_rerank = not args.no_keyword_rerank
+    # Keyword rerank: TF-IDF-ish over candidates + phrase matching
+    use_rerank = not args.no_rerank
     alpha = args.alpha
+    max_tokens = args.rerank_tokens
+    max_phrases = args.rerank_phrases
 
     if use_rerank:
-        query_tokens = _extract_tokens(query_text)
-        phrase_boosts = [p for p in PHRASE_BOOSTS if _normalize_text(p) in _normalize_text(query_text)]
-        logger.info("Rerank: enabled=True alpha=%.2f tokens=%d phrases=%d", alpha, len(query_tokens), len(phrase_boosts))
-
-        reranked = []
-        for doc, dense_score in results:
-            doc_text = doc.get("text", "")
-            keyword_score = _keyword_score(doc_text, query_tokens, phrase_boosts)
-            final_score = dense_score + alpha * keyword_score
-            reranked.append((doc, final_score, dense_score, keyword_score))
-        reranked.sort(key=lambda x: x[1], reverse=True)
-        results_for_agg = reranked
+        logger.info("Rerank: enabled=True alpha=%.2f tokens=%d phrases=%d", alpha, max_tokens, max_phrases)
+        results_for_agg = rerank(
+            results,
+            query_text,
+            alpha=alpha,
+            max_tokens=max_tokens,
+            max_phrases=max_phrases,
+        )
     else:
         logger.info("Rerank: enabled=False")
         results_for_agg = [(doc, dense_score, dense_score, 0.0) for doc, dense_score in results]
@@ -283,8 +240,9 @@ def main() -> None:
         for j, ev in enumerate(camp["evidence_snippets"], 1):
             snippet = (ev.get("snippet") or "").replace("\n", " ")
             ds = ev.get("dense_score", 0)
-            ks = ev.get("keyword_score", 0)
-            print(f"  Evidence {j}: {ev.get('doc_id', '')} (dense={ds:.3f} kw={ks:.3f}) ... {snippet}...")
+            kw = ev.get("keyword_score", 0)
+            comb = ev.get("combined", 0)
+            print(f"  Evidence {j}: {ev.get('doc_id', '')} (dense={ds:.3f} kw={kw:.3f} combined={comb:.3f}) ... {snippet}...")
         if i == 0:
             best_text = (camp.get("best_doc", {}).get("text") or "")[:120].replace("\n", " ")
             print()
