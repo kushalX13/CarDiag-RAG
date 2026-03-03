@@ -110,6 +110,9 @@ def load_faiss_indexes(cache_dir: str = "data/indexes/") -> dict:
         "makes": {},  # make_norm -> {index, mapping, docs}
     }
 
+    if not os.path.isdir(cache_dir):
+        return result
+
     def _load_one(name: str) -> tuple | None:
         idx_path = os.path.join(cache_dir, f"{name}.faiss")
         map_path = os.path.join(cache_dir, f"{name}_mapping.json")
