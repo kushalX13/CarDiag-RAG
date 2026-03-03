@@ -4,11 +4,12 @@ import json
 import logging
 import os
 from collections import defaultdict
-from pathlib import Path
 
 import faiss
 import numpy as np
 from sentence_transformers import SentenceTransformer
+
+from .utils import model_key as compute_model_key, normalize_make
 
 logger = logging.getLogger(__name__)
 
@@ -167,32 +168,52 @@ def search(
     min_pool_docs: int = 50,
 ) -> list[tuple[dict, float]]:
     """
-    Search for relevant docs. Chooses index:
-    - (make_norm, model_key) pool if exists and has >= min_pool_docs
-    - else make-only fallback
+    Search for relevant docs. STRICT index selection:
+    - (make_norm, model_key) pool if exists and has >= min_pool_docs: only search that pool (no fallback)
+    - else (pool has < min_pool_docs or missing): make-only fallback
     - else global
 
     Returns list of (doc, score) sorted by score desc.
     """
+    # Ensure normalization matches index keys (same as corpus/build_faiss_indexes)
+    make_norm = normalize_make(make_norm) if make_norm else ""
+    model_key = compute_model_key(model_key) if model_key else ""
+
     pool_key = (make_norm, model_key)
     entry = None
-    index_type = "global"
+    index_name = "global"
 
     if use_pool_indexes:
         pool_entry = indexes.get("pools", {}).get(pool_key)
-        if pool_entry and len(pool_entry["docs"]) >= min_pool_docs:
-            entry = pool_entry
-            index_type = "pool"
+        if pool_entry:
+            n_docs = len(pool_entry["docs"])
+            if n_docs >= min_pool_docs:
+                # Model-specific pool exists and is large enough: use it ONLY, no fallback
+                entry = pool_entry
+                index_name = f"pool_{make_norm}_{model_key}"
+            else:
+                # Pool exists but too small: fallback to make-only
+                make_entry = indexes.get("makes", {}).get(make_norm)
+                if make_entry:
+                    entry = make_entry
+                    index_name = f"make_{make_norm}"
         else:
+            # No pool: fallback to make-only
             make_entry = indexes.get("makes", {}).get(make_norm)
             if make_entry:
                 entry = make_entry
-                index_type = "make"
+                index_name = f"make_{make_norm}"
 
     if entry is None:
         entry = indexes.get("global")
         if entry is None:
             return []
+        index_name = "global"
+
+    n_docs = len(entry["docs"])
+    index_msg = f"{index_name} ({n_docs} docs)"
+    logger.info("Using index: %s", index_msg)
+    print(f"Selected index: {index_msg}")
 
     faiss_index = entry["index"]
     docs = entry["docs"]
@@ -214,10 +235,14 @@ def search(
 
 def aggregate_by_campaign(
     results: list[tuple[dict, float]],
+    make_norm: str | None = None,
 ) -> list[dict]:
     """
     Group by campaign_number and compute:
       campaign_score = sum(scores) + 0.2*max(scores) + 0.5*count
+
+    If make_norm is provided: drop cross-make docs (doc.make_norm != make_norm).
+    This prevents wrong-make campaigns from ranking when user specified a vehicle.
 
     For each campaign store:
       - campaign_number
@@ -227,6 +252,9 @@ def aggregate_by_campaign(
 
     Sort campaigns by campaign_score desc.
     """
+    if make_norm:
+        results = [(doc, s) for doc, s in results if (doc.get("make_norm") or "") == make_norm]
+
     by_campaign: dict[str, list[tuple[dict, float]]] = defaultdict(list)
     for doc, score in results:
         cn = doc.get("campaign_number") or ""

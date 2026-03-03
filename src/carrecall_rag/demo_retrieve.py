@@ -134,8 +134,8 @@ def main() -> None:
         logger.info("No results found.")
         sys.exit(0)
 
-    # Aggregate by campaign
-    campaigns = aggregate_by_campaign(results)
+    # Aggregate by campaign (filter cross-make when user specified vehicle)
+    campaigns = aggregate_by_campaign(results, make_norm=make_norm or None)
 
     # Print top campaigns
     for i, camp in enumerate(campaigns[: args.topc]):
