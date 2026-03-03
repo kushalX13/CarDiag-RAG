@@ -4,6 +4,7 @@ import json
 import logging
 import os
 from collections import defaultdict
+from pathlib import Path
 
 import faiss
 import numpy as np
@@ -105,6 +106,11 @@ def load_faiss_indexes(cache_dir: str = "data/indexes/") -> dict:
     Returns dict with keys: "global", "pools", "makes".
     Each index entry has: index (faiss.Index), mapping (list of {doc_id, campaign_number}), docs (full doc list).
     """
+    cache_path = Path(cache_dir)
+    logger.info(f"Loading indexes from: {cache_dir} (abs: {cache_path.resolve()})")
+    logger.info(f"Exists? {cache_path.exists()}  | files: {len(list(cache_path.glob('*'))) if cache_path.exists() else 0}")
+    logger.info(f"Sample files: {[p.name for p in list(cache_path.glob('*'))[:20]] if cache_path.exists() else []}")
+
     result = {
         "global": None,
         "pools": {},  # pool_FORD_f150 -> {index, mapping, docs}
