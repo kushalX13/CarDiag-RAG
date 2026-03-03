@@ -21,6 +21,7 @@ logger = logging.getLogger(__name__)
 
 SEED = 42
 BIENCODER_MODEL_DIR = os.path.join(DATA_DIR, "models", "biencoder")
+BIENCODER_MPNET_DIR = os.path.join(DATA_DIR, "models", "biencoder_mpnet")
 TRAIN_TRIPLES_PATH = os.path.join(PROCESSED_DIR, "train_triples.jsonl")
 
 
@@ -175,6 +176,12 @@ def main() -> None:
         default=None,
         help="If set, only load/process the first N training triples",
     )
+    parser.add_argument(
+        "--model-output-dir",
+        type=str,
+        default=None,
+        help="Where to save trained model (default: data/models/biencoder for MiniLM, data/models/biencoder_mpnet for MPNet)",
+    )
     args = parser.parse_args()
 
     set_seed(args.seed)
@@ -206,13 +213,21 @@ def main() -> None:
     model.to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
 
-    os.makedirs(BIENCODER_MODEL_DIR, exist_ok=True)
+    # Output dir: explicit, or auto by model (MPNet -> biencoder_mpnet, else biencoder)
+    if args.model_output_dir is not None:
+        output_dir = args.model_output_dir
+    elif "mpnet" in args.model.lower():
+        output_dir = BIENCODER_MPNET_DIR
+    else:
+        output_dir = BIENCODER_MODEL_DIR
+
+    os.makedirs(output_dir, exist_ok=True)
 
     for epoch in range(args.epochs):
         loss = train_epoch(model, dataloader, optimizer, device, use_amp)
         logger.info("Epoch %d: loss = %.4f", epoch + 1, loss)
 
-    model.save(BIENCODER_MODEL_DIR)
+    model.save(output_dir)
     config = {
         "base_model": args.model,
         "epochs": args.epochs,
@@ -220,10 +235,10 @@ def main() -> None:
         "lr": args.lr,
         "seed": args.seed,
     }
-    config_path = os.path.join(BIENCODER_MODEL_DIR, "train_config.json")
+    config_path = os.path.join(output_dir, "train_config.json")
     with open(config_path, "w", encoding="utf-8") as f:
         json.dump(config, f, indent=2)
-    logger.info("Saved model to %s", BIENCODER_MODEL_DIR)
+    logger.info("Saved model to %s", output_dir)
 
 
 if __name__ == "__main__":
