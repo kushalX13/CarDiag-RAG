@@ -53,6 +53,7 @@ data/raw/
 data/processed/
 data/models/
 downloded-data/
+data/
 
 # Logs
 *.log
