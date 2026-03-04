@@ -66,9 +66,13 @@ def _aggregate_by_campaign_with_scores(
 
     campaign_results = []
     for cn, items in by_campaign.items():
-        # Per passage: use combined. Per campaign: sum(combined) + 0.1*max(combined) + 0.5*hits
+        # Per campaign: max(combined) — "a campaign is as good as its best supporting snippet"
         combined_scores = [s[1] for s in items]  # s[1] = combined
-        campaign_score = sum(combined_scores) + 0.1 * max(combined_scores) + 0.5 * len(items)
+        if cn in ("22V406000", "18V332000"):
+            print("DEBUG cn", cn, "hits", len(items),
+                  "max_comb", max(combined_scores),
+                  "sum_comb", sum(combined_scores))
+        campaign_score = max(combined_scores)
         best = max(items, key=lambda x: x[1])  # x[1] = combined
         best_doc, best_combined, best_dense, best_kw = best
         sorted_items = sorted(items, key=lambda x: x[1], reverse=True)
