@@ -26,11 +26,25 @@ python -m carrecall_rag.demo_retrieve \
   --topk 30 --topc 3 --alpha 0.50
 
 echo ""
-echo "=== C1) Query-dependent: door latch freezes ==="
+echo "=== C1) Query-dependent: door latch freezes (with --show-candidates to debug) ==="
 python -m carrecall_rag.demo_retrieve \
   --make "Ford" --model "F-150" \
   --query "door latch freezes" \
-  --topk 30 --topc 3 --alpha 0.15
+  --topk 30 --topc 3 --alpha 0.15 --show-candidates
+
+echo ""
+echo "=== C1b) door latch - topk=200 (retrieve all in pool) ==="
+python -m carrecall_rag.demo_retrieve \
+  --make "Ford" --model "F-150" \
+  --query "door latch freezes" \
+  --topk 200 --topc 3 --alpha 0.15 --show-candidates
+
+echo ""
+echo "=== C1c) door latch - global index (--no-pool) for broader dense recall ==="
+python -m carrecall_rag.demo_retrieve \
+  --make "Ford" --model "F-150" \
+  --query "door latch freezes" \
+  --topk 200 --topc 3 --alpha 0.15 --no-pool --show-candidates
 
 echo ""
 echo "=== C2) Query-dependent: brake fluid leak ==="

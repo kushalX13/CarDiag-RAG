@@ -147,6 +147,11 @@ def main() -> None:
         action="store_true",
         help="Disable keyword reranking",
     )
+    parser.add_argument(
+        "--show-candidates",
+        action="store_true",
+        help="Print candidate doc IDs + snippets before rerank (for debugging recall)",
+    )
     args = parser.parse_args()
 
     make_norm = normalize_make(args.make) if args.make else ""  # "Ford" -> "FORD"
@@ -207,6 +212,16 @@ def main() -> None:
     if not results:
         logger.info("No results found.")
         sys.exit(0)
+
+    # Debug: print candidates before rerank (confirm if right doc is in set)
+    if args.show_candidates:
+        print("\n--- Candidates (before rerank) ---")
+        for i, (doc, dense_score) in enumerate(results[:30]):
+            cid = doc.get("campaign_number", "")
+            did = doc.get("doc_id", "")
+            snippet = (doc.get("text", "") or "")[:80].replace("\n", " ")
+            print(f"  {i+1}. {cid} | {did} | {snippet}...")
+        print("---\n")
 
     # Keyword rerank: TF-IDF-ish over candidates + phrase matching
     use_rerank = not args.no_rerank
