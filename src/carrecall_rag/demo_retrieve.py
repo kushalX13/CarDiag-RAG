@@ -129,8 +129,8 @@ def main() -> None:
     parser.add_argument(
         "--alpha",
         type=float,
-        default=0.15,
-        help="Weight for keyword: combined = (1-alpha)*dense + alpha*kw_norm",
+        default=0.30,
+        help="Weight for keyword: combined = (1-alpha)*dense + alpha*kw_norm (default 0.30 for hybrid)",
     )
     parser.add_argument(
         "--rerank-tokens",
