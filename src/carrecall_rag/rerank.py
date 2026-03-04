@@ -7,17 +7,18 @@ from collections import Counter, defaultdict
 
 logger = logging.getLogger(__name__)
 
-# English + domain stopwords
+# English + domain stopwords. MUST NOT include: latch, latches, freeze, freezes,
+# door, actuator, cable (needed for latch/freeze/brake queries).
 STOPWORDS = {
     "the", "and", "for", "are", "but", "not", "you", "all", "can", "had", "her", "was",
     "one", "our", "out", "has", "his", "how", "its", "may", "new", "now", "old", "see",
     "way", "who", "did", "get", "got", "let", "put", "say", "too", "use", "any", "own",
     "ford", "motor", "company", "vehicle", "vehicles", "recall", "recalls", "certain",
-    "model", "models", "year", "years", "equipped", "campaign", "f150", "f-150",
+    "model", "models", "year", "years", "equipped", "campaign", "f150",
     "pickup", "truck", "trucks", "honda", "toyota", "nhtsa", "dealer", "dealers",
 }
 
-# Default symptom phrases with boosts
+# Default symptom phrases with boosts (include latch/freeze for door-latch queries)
 DEFAULT_PHRASES = [
     ("loss of power", 2.0),
     ("engine stalls", 2.0),
@@ -27,6 +28,9 @@ DEFAULT_PHRASES = [
     ("power loss", 2.0),
     ("cut out", 1.5),
     ("stalling", 1.5),
+    ("door latch", 2.0),
+    ("door latch freezes", 2.0),
+    ("latch freezes", 1.5),
 ]
 
 
