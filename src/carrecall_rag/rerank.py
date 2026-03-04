@@ -81,9 +81,11 @@ def rerank(
     alpha: float = 0.15,
     max_tokens: int = 12,
     max_phrases: int = 10,
+    normalize_dense: bool = False,
 ) -> list[tuple[dict, float, float, float]]:
     """
     Rerank (doc, dense_score) by combined = (1-alpha)*dense + alpha*kw_norm.
+    If normalize_dense: scale dense to [0,1] so keyword-only docs (dense=0) can compete.
     Returns [(doc, combined, dense_score, kw_norm), ...] sorted by combined desc.
     """
     if not results:
@@ -148,11 +150,17 @@ def rerank(
     top5_kw = [f"{x[2]:.4f}" for x in sorted_by_kw[:5]]
     logger.info("kw top5: %s  |  min=%.4f max=%.4f", top5_kw, kw_min, kw_max)
 
+    # Optionally normalize dense for hybrid (keyword-only docs have dense=0)
+    dense_vals = [d for _, d, _ in kw_scores]
+    dense_min, dense_max = min(dense_vals), max(dense_vals)
+    dense_span = max(dense_max - dense_min, eps)
+
     # Combine and sort
     output = []
     for doc, dense_score, kw in kw_scores:
         kw_norm = (kw - kw_min) / span
-        combined = (1 - alpha) * dense_score + alpha * kw_norm
+        dense_norm = (dense_score - dense_min) / dense_span if normalize_dense else dense_score
+        combined = (1 - alpha) * dense_norm + alpha * kw_norm
         output.append((doc, combined, dense_score, kw_norm))
 
     output.sort(key=lambda x: x[1], reverse=True)

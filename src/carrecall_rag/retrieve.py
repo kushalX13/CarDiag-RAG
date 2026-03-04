@@ -1,16 +1,24 @@
-"""Retrieval module: FAISS indexes, search, and campaign aggregation."""
+"""Retrieval module: FAISS indexes, search, keyword search, and campaign aggregation."""
 
 import json
 import logging
 import os
+import re
 from collections import defaultdict
 from pathlib import Path
 
 import faiss
 import numpy as np
+from rank_bm25 import BM25Okapi
 from sentence_transformers import SentenceTransformer
 
 from .utils import model_key as compute_model_key, normalize_make
+
+
+def _bm25_tokenize(text: str) -> list[str]:
+    """Lowercase, split on non-alphanum."""
+    text = (text or "").lower()
+    return re.findall(r"[a-z0-9]+", text)
 
 logger = logging.getLogger(__name__)
 
@@ -251,6 +259,50 @@ def search(
         if idx < len(docs):
             results.append((docs[idx], float(score)))
     return results
+
+
+def keyword_search(
+    query_text: str,
+    make_norm: str,
+    model_key: str,
+    indexes: dict,
+    top_k: int = 100,
+    use_pool_indexes: bool = True,
+    min_pool_docs: int = 50,
+) -> list[tuple[dict, float]]:
+    """
+    BM25 keyword search over the same index as search (pool/make/global).
+    Returns [(doc, bm25_score), ...] sorted by score desc.
+    """
+    make_norm = normalize_make(make_norm) if make_norm else ""
+    model_key = compute_model_key(model_key) if model_key else ""
+
+    if use_pool_indexes:
+        entry, index_name, _ = select_index(
+            make_norm,
+            model_key,
+            indexes.get("pools", {}),
+            indexes.get("makes", {}),
+            indexes.get("global"),
+            min_pool_docs=min_pool_docs,
+        )
+    else:
+        entry = indexes.get("global")
+
+    if entry is None:
+        return []
+
+    docs = entry["docs"]
+    if not docs:
+        return []
+
+    tokenized = [_bm25_tokenize(d.get("text", "")) for d in docs]
+    bm25 = BM25Okapi(tokenized)
+    query_tokens = _bm25_tokenize(query_text)
+    scores = bm25.get_scores(query_tokens)
+    indexed = list(zip(docs, scores))
+    indexed.sort(key=lambda x: x[1], reverse=True)
+    return [(d, float(s)) for d, s in indexed[:top_k]]
 
 
 def aggregate_by_campaign(

@@ -12,6 +12,7 @@ from .config import DATA_DIR, PROCESSED_DIR
 from .rerank import rerank
 from .retrieve import (
     build_faiss_indexes,
+    keyword_search,
     load_corpus,
     load_faiss_indexes,
     search,
@@ -99,7 +100,7 @@ def main() -> None:
     parser.add_argument("--model", type=str, default="", help="Vehicle model (e.g. F-150)")
     parser.add_argument("--year", type=int, default=None, help="Vehicle year (e.g. 2017)")
     parser.add_argument("--query", type=str, default=None, help="Query text; if missing, read multiline from stdin")
-    parser.add_argument("--topk", type=int, default=30, help="Number of docs to retrieve")
+    parser.add_argument("--topk", type=int, default=30, help="Number of docs to retrieve (or dense_topk when --hybrid)")
     parser.add_argument("--topc", type=int, default=3, help="Number of campaigns to show")
     parser.add_argument(
         "--model-dir",
@@ -152,6 +153,23 @@ def main() -> None:
         action="store_true",
         help="Print candidate doc IDs + snippets before rerank (for debugging recall)",
     )
+    parser.add_argument(
+        "--hybrid",
+        action="store_true",
+        help="Union of dense + keyword retrieval before rerank (dense_topk + keyword_topk)",
+    )
+    parser.add_argument(
+        "--dense-topk",
+        type=int,
+        default=100,
+        help="Dense retrieval topk when --hybrid",
+    )
+    parser.add_argument(
+        "--keyword-topk",
+        type=int,
+        default=100,
+        help="Keyword (BM25) retrieval topk when --hybrid",
+    )
     args = parser.parse_args()
 
     make_norm = normalize_make(args.make) if args.make else ""  # "Ford" -> "FORD"
@@ -197,17 +215,46 @@ def main() -> None:
         sys.exit(1)
     model = SentenceTransformer(args.model_dir)
 
-    # Search
+    # Search: dense only, or hybrid (union of dense + keyword)
+    use_hybrid = args.hybrid
+    dense_topk = args.dense_topk if use_hybrid else args.topk
+    keyword_topk = args.keyword_topk if use_hybrid else 0
+
     results = search(
         search_query,
         make_norm,
         mkey,
         indexes,
         model,
-        top_k=args.topk,
+        top_k=dense_topk,
         use_pool_indexes=not args.no_pool,
         min_pool_docs=50,
     )
+
+    if use_hybrid and keyword_topk > 0:
+        n_dense = len(results)
+        kw_results = keyword_search(
+            query_text,
+            make_norm,
+            mkey,
+            indexes,
+            top_k=keyword_topk,
+            use_pool_indexes=not args.no_pool,
+            min_pool_docs=50,
+        )
+        n_kw = len(kw_results)
+        # Union: dedupe by doc_id, keep dense score when available
+        seen: dict[str, tuple[dict, float]] = {}
+        for doc, dense_score in results:
+            did = doc.get("doc_id", "")
+            if did and did not in seen:
+                seen[did] = (doc, dense_score)
+        for doc, _ in kw_results:
+            did = doc.get("doc_id", "")
+            if did and did not in seen:
+                seen[did] = (doc, 0.0)  # keyword-only: dense=0
+        results = list(seen.values())
+        logger.info("Hybrid: dense=%d + keyword=%d -> union=%d", n_dense, n_kw, len(results))
 
     if not results:
         logger.info("No results found.")
@@ -230,13 +277,15 @@ def main() -> None:
     max_phrases = args.rerank_phrases
 
     if use_rerank:
-        logger.info("Rerank: enabled=True alpha=%.2f tokens=%d phrases=%d", alpha, max_tokens, max_phrases)
+        mode = "hybrid" if use_hybrid else "dense-only"
+        logger.info("Rerank: enabled=True mode=%s alpha=%.2f tokens=%d phrases=%d", mode, alpha, max_tokens, max_phrases)
         results_for_agg = rerank(
             results,
             query_text,
             alpha=alpha,
             max_tokens=max_tokens,
             max_phrases=max_phrases,
+            normalize_dense=use_hybrid,
         )
     else:
         logger.info("Rerank: enabled=False")
