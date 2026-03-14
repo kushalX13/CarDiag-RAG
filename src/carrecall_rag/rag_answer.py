@@ -154,10 +154,62 @@ def _extract_short_reason(campaign: dict, max_len: int = 50) -> str:
     return _truncate(_extract_issue_and_consequence(snippet), max_len) or "related recall"
 
 
+def _extract_candidate_specific_desc(campaign: dict) -> str:
+    """Extract a short, grounded description from the candidate's own evidence."""
+    best = campaign.get("best_doc") or {}
+    component = (best.get("component") or "").strip()
+    evs = campaign.get("evidence_snippets") or []
+    texts = [best.get("text", "")] + [e.get("snippet", "") for e in evs[:2]]
+    combined = " ".join(t for t in texts if t).strip()
+
+    def _clean_desc(s: str, max_len: int = 45) -> str:
+        """Truncate at word boundary; avoid trailing fragments like 'either the'."""
+        s = (s or "").strip()
+        if len(s) <= max_len:
+            return s
+        cut = s[:max_len].rsplit(" ", 1)[0]
+        # Drop trailing incomplete phrases
+        cut = re.sub(r",?\s+(?:either|which|that|the|a)\s*$", "", cut).strip()
+        return cut + "..." if len(cut) < len(s) else cut
+
+    # Prefer component when it's descriptive (not generic)
+    if component and len(component) > 5 and component.lower() not in {"unknown", "other"}:
+        defect, consequence = _extract_defect_and_consequence(combined)
+        # Only add consequence if it's a clean phrase (not "either the...", "which may...")
+        if consequence and not re.match(r"^(?:either|which|that|the|a)\s", consequence, re.IGNORECASE):
+            if "engine stall" in consequence.lower():
+                return f"{_clean_desc(component, 45)}; may cause engine stall"
+            if "stall" in consequence.lower():
+                return f"{_clean_desc(component, 45)}; can lead to stalling"
+            if len(consequence) < 50:
+                return f"{_clean_desc(component, 38)}; {_clean_desc(consequence, 38)}"
+        return _clean_desc(component, 55)
+
+    # Fallback: extract defect/consequence from text
+    defect, consequence = _extract_defect_and_consequence(combined)
+    if defect and consequence:
+        return f"{_clean_desc(defect, 35)}; {_clean_desc(consequence, 35)}"
+    if defect:
+        return _clean_desc(defect, 55)
+    if consequence:
+        return _clean_desc(consequence, 55)
+
+    # Last resort: title or first substantive phrase
+    title = _extract_short_title(campaign, 55)
+    if title and title != "Recall campaign":
+        return title
+    first = re.split(r"\.\s+", combined)[0] if combined else ""
+    stripped = _strip_boilerplate(first)
+    return _clean_desc(stripped or first, 50) if stripped or first else "related recall"
+
+
 def _extract_relevance_note(
     campaign: dict, best_campaign: dict, query: str
 ) -> str:
-    """Short relevance note for secondary candidate (e.g. related, lower-confidence)."""
+    """
+    Short relevance note for secondary candidate.
+    Uses candidate-specific description from its own evidence; adds confidence qualifier when weak.
+    """
     best_parts = [(best_campaign.get("best_doc") or {}).get("text", "")]
     best_parts.extend(e.get("snippet", "") for e in (best_campaign.get("evidence_snippets") or []))
     best_text = " ".join(best_parts).lower()
@@ -167,29 +219,22 @@ def _extract_relevance_note(
     camp_text = " ".join(camp_parts).lower()
     q = (query or "").lower()
 
-    # Query keywords in this campaign vs best
-    q_words = set(re.findall(r"[a-z0-9]{3,}", q)) - {"the", "and", "for", "may", "can"}
+    # Query keyword overlap: this candidate vs best match
+    q_words = set(re.findall(r"[a-z0-9]{3,}", q)) - {"the", "and", "for", "may", "can", "with", "into"}
     overlap_best = sum(1 for w in q_words if w in best_text)
     overlap_this = sum(1 for w in q_words if w in camp_text)
 
-    # Category hints
-    engine_terms = ["engine", "stall", "fuel", "pump", "hpfp", "sensor", "crankshaft"]
-    brake_terms = ["brake", "cylinder", "booster", "fluid", "leak"]
-    electrical_terms = ["module", "electrical", "wiring", "cruise", "control"]
+    # Candidate-specific description from its own evidence (never generic "engine-related" unless evidence supports it)
+    specific = _extract_candidate_specific_desc(campaign)
 
-    if any(t in camp_text for t in engine_terms) and any(t in q for t in engine_terms):
-        if overlap_this < overlap_best:
-            return "another engine-related issue that can lead to stalling"
-        return "related engine or fuel system issue"
-    if any(t in camp_text for t in brake_terms) and any(t in q for t in brake_terms):
-        return "related brake system concern"
-    if any(t in camp_text for t in electrical_terms):
-        if overlap_this < overlap_best:
-            return "lower-confidence electrical issue; less directly related to your query"
-        return "electrical or control module issue"
+    # Low relevance: few query terms in this candidate, or significantly fewer than best
+    is_weak = overlap_this < 2 or (overlap_best > 0 and overlap_this < overlap_best * 0.5)
+
+    if is_weak:
+        return f"lower-confidence match; {specific}"
     if overlap_this < overlap_best:
-        return "lower-confidence match; less directly related"
-    return "related recall worth checking"
+        return f"less directly related secondary candidate; {specific}"
+    return specific
 
 
 def _extract_safety_phrases(text: str) -> list[str]:
@@ -421,8 +466,8 @@ def _format_output(
     if other_candidates:
         lines.append("Other Relevant Recall Candidates:")
         for cn, reason, note in other_candidates:
-            # Use relevance note when specific; otherwise use reason (title)
-            desc = note if note and note != "related recall worth checking" else reason
+            # Use note when it's candidate-specific; otherwise use reason (title)
+            desc = reason if note in ("related recall", "related recall worth checking") else note
             lines.append(f"  - {cn} — {desc}")
         lines.append("")
 
