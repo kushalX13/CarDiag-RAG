@@ -31,6 +31,8 @@ DEFAULT_MODEL_DIR = os.path.join(DATA_DIR, "models", "biencoder")
 DEFAULT_CORPUS_PATH = os.path.join(PROCESSED_DIR, "corpus_merged.jsonl")
 DEFAULT_CACHE_DIR = os.path.join(DATA_DIR, "indexes")
 
+RetrievalMode = str  # "dense" | "keyword" | "hybrid"
+
 
 def run_retrieval(
     query_text: str,
@@ -38,40 +40,44 @@ def run_retrieval(
     model: str,
     year: int | None,
     indexes: dict,
-    encoder: SentenceTransformer,
+    encoder: SentenceTransformer | None,
     *,
+    mode: RetrievalMode = "hybrid",
     dense_topk: int = 100,
     keyword_topk: int = 150,
     alpha: float = 0.30,
-    use_hybrid: bool = True,
     use_pool_indexes: bool = True,
     min_pool_docs: int = 50,
     rerank_tokens: int = 12,
     rerank_phrases: int = 10,
 ) -> list[str]:
     """
-    Run full retrieval pipeline: search -> rerank -> aggregate_by_campaign.
+    Run retrieval pipeline: search (dense/keyword/hybrid) -> rerank -> aggregate.
     Returns list of campaign_numbers in rank order (top first).
+    mode: "dense" | "keyword" | "hybrid"
     """
     make_norm = normalize_make(make) if make else ""
     mkey = model_key(model) if model else ""
 
     search_query = _build_query_from_context(make, model, year, query_text)
 
-    # Dense search
-    results = search(
-        search_query,
-        make_norm,
-        mkey,
-        indexes,
-        encoder,
-        top_k=dense_topk,
-        use_pool_indexes=use_pool_indexes,
-        min_pool_docs=min_pool_docs,
-    )
+    # Dense search (skip for keyword-only)
+    if mode == "keyword":
+        results = []
+    else:
+        results = search(
+            search_query,
+            make_norm,
+            mkey,
+            indexes,
+            encoder,
+            top_k=dense_topk,
+            use_pool_indexes=use_pool_indexes,
+            min_pool_docs=min_pool_docs,
+        )
 
-    # Hybrid: union with keyword results
-    if use_hybrid and keyword_topk > 0:
+    # Keyword search (for hybrid or keyword-only)
+    if mode in ("hybrid", "keyword"):
         kw_results = keyword_search(
             query_text,
             make_norm,
@@ -81,28 +87,32 @@ def run_retrieval(
             use_pool_indexes=use_pool_indexes,
             min_pool_docs=min_pool_docs,
         )
-        seen: dict[str, tuple[dict, float]] = {}
-        for doc, dense_score in results:
-            did = doc.get("doc_id", "")
-            if did and did not in seen:
-                seen[did] = (doc, dense_score)
-        for doc, _ in kw_results:
-            did = doc.get("doc_id", "")
-            if did and did not in seen:
-                seen[did] = (doc, 0.0)
-        results = list(seen.values())
+        if mode == "keyword":
+            results = kw_results
+        else:
+            seen: dict[str, tuple[dict, float]] = {}
+            for doc, dense_score in results:
+                did = doc.get("doc_id", "")
+                if did and did not in seen:
+                    seen[did] = (doc, dense_score)
+            for doc, _ in kw_results:
+                did = doc.get("doc_id", "")
+                if did and did not in seen:
+                    seen[did] = (doc, 0.0)
+            results = list(seen.values())
 
     if not results:
         return []
 
-    # Rerank
+    # Rerank: alpha=0 for pure dense, alpha=1 for pure keyword, hybrid uses given alpha
+    rerank_alpha = 0.0 if mode == "dense" else (1.0 if mode == "keyword" else alpha)
     results_for_agg = rerank(
         results,
         query_text,
-        alpha=alpha,
+        alpha=rerank_alpha,
         max_tokens=rerank_tokens,
         max_phrases=rerank_phrases,
-        normalize_dense=use_hybrid,
+        normalize_dense=(mode == "hybrid"),
     )
 
     # Aggregate by campaign
@@ -112,6 +122,39 @@ def run_retrieval(
     )
 
     return [c["campaign_number"] for c in campaigns]
+
+
+def _parse_gold(row: dict) -> list[str]:
+    """Extract gold campaign(s) from row. Supports gold_campaign or gold_campaigns."""
+    golds = row.get("gold_campaigns")
+    if golds is not None:
+        return [str(g).strip() for g in (golds if isinstance(golds, list) else [golds]) if g]
+    g = row.get("gold_campaign")
+    return [g.strip()] if g and str(g).strip() else []
+
+
+def _best_gold_rank(golds: list[str], campaigns: list[str]) -> tuple[int | None, str | None]:
+    """1-based rank of first/best gold hit, and which gold. None if absent."""
+    best_rank = None
+    best_gold = None
+    for gold in golds:
+        for i, c in enumerate(campaigns):
+            if c == gold:
+                r = i + 1
+                if best_rank is None or r < best_rank:
+                    best_rank = r
+                    best_gold = gold
+                break
+    return best_rank, best_gold
+
+
+def _gold_status(rank: int | None, top_k: int = 10) -> str:
+    """Describe whether gold entered candidate set and where it ranked."""
+    if rank is None:
+        return "MISS (never in candidate set)"
+    if rank <= top_k:
+        return f"rank {rank}"
+    return f"in candidates but ranked low (rank {rank})"
 
 
 def main() -> None:
@@ -125,16 +168,29 @@ def main() -> None:
         help="JSONL file with query, make, model, gold_campaign per line",
     )
     parser.add_argument(
+        "--output",
+        type=str,
+        default="eval/results/retrieval_debug.jsonl",
+        help="JSONL file for per-query debug output",
+    )
+    parser.add_argument(
+        "--mode",
+        type=str,
+        choices=["dense", "keyword", "hybrid"],
+        default="hybrid",
+        help="Retrieval mode: dense, keyword, or hybrid",
+    )
+    parser.add_argument(
         "--dense-topk",
         type=int,
         default=100,
-        help="Dense retrieval topk when --hybrid",
+        help="Dense retrieval topk",
     )
     parser.add_argument(
         "--keyword-topk",
         type=int,
         default=150,
-        help="Keyword (BM25) retrieval topk when --hybrid",
+        help="Keyword (BM25) retrieval topk",
     )
     parser.add_argument(
         "--topc",
@@ -146,12 +202,13 @@ def main() -> None:
         "--alpha",
         type=float,
         default=0.30,
-        help="Weight for keyword: combined = (1-alpha)*dense + alpha*kw_norm",
+        help="Weight for keyword in hybrid: combined = (1-alpha)*dense + alpha*kw_norm",
     )
     parser.add_argument(
-        "--hybrid",
-        action="store_true",
-        help="Use hybrid (dense + keyword) retrieval",
+        "--alpha-list",
+        type=str,
+        default=None,
+        help="Comma-separated alphas for sweep (e.g. 0.1,0.3,0.5,0.7). Only for mode=hybrid.",
     )
     parser.add_argument(
         "--model-dir",
@@ -179,7 +236,7 @@ def main() -> None:
     parser.add_argument(
         "--verbose",
         action="store_true",
-        help="Print per-query debug (query, gold, top-K, hit)",
+        help="Extra verbose logging",
     )
     args = parser.parse_args()
 
@@ -190,6 +247,15 @@ def main() -> None:
     # Reduce log noise during eval unless verbose
     if not args.verbose:
         logging.getLogger("carrecall_rag").setLevel(logging.WARNING)
+
+    # Alpha sweep: list of alphas to try (only for hybrid)
+    if args.alpha_list:
+        alpha_values = [float(x.strip()) for x in args.alpha_list.split(",")]
+        if args.mode != "hybrid":
+            logger.warning("--alpha-list ignored when mode != hybrid")
+            alpha_values = [args.alpha]
+    else:
+        alpha_values = [args.alpha]
 
     # Load eval queries
     queries = []
@@ -204,6 +270,7 @@ def main() -> None:
         sys.exit(1)
 
     logger.info("Loaded %d eval queries from %s", len(queries), args.eval_file)
+    logger.info("Mode: %s | Alpha(s): %s", args.mode, alpha_values)
 
     # Load or build indexes
     indexes = load_faiss_indexes(args.cache_dir)
@@ -226,70 +293,112 @@ def main() -> None:
         logger.error("Failed to load indexes from %s", args.cache_dir)
         sys.exit(1)
 
-    # Load encoder
-    if not os.path.exists(args.model_dir):
-        logger.error("Model not found: %s. Run train_biencoder first.", args.model_dir)
-        sys.exit(1)
-    encoder = SentenceTransformer(args.model_dir)
+    # Load encoder (not needed for keyword-only)
+    encoder: SentenceTransformer | None = None
+    if args.mode != "keyword":
+        if not os.path.exists(args.model_dir):
+            logger.error("Model not found: %s. Run train_biencoder first.", args.model_dir)
+            sys.exit(1)
+        encoder = SentenceTransformer(args.model_dir)
 
-    # Run retrieval for each query and track Recall@K
-    hit_at: dict[int, int] = defaultdict(int)
+    # Ensure output dir exists
+    os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
+
     k_values = [1, 3, 5, 10]
     topc = max(args.topc, max(k_values))
 
-    for i, row in enumerate(queries):
-        query = row.get("query", "").strip()
-        make = row.get("make", "")
-        model = row.get("model", "")
-        gold = (row.get("gold_campaign") or "").strip()
-        year = row.get("year")
+    # Run for each alpha (sweep) or single alpha
+    for alpha in alpha_values:
+        hit_at: dict[int, int] = defaultdict(int)
+        miss_count = 0
+        debug_rows: list[dict] = []
 
-        if not query or not gold:
-            logger.warning("Skipping row %d: missing query or gold_campaign", i + 1)
-            continue
+        for i, row in enumerate(queries):
+            query = row.get("query", "").strip()
+            make = row.get("make", "")
+            model = row.get("model", "")
+            golds = _parse_gold(row)
+            year = row.get("year")
 
-        top_campaigns = run_retrieval(
-            query,
-            make,
-            model,
-            year,
-            indexes,
-            encoder,
-            dense_topk=args.dense_topk,
-            keyword_topk=args.keyword_topk if args.hybrid else 0,
-            alpha=args.alpha,
-            use_hybrid=args.hybrid,
-            use_pool_indexes=not args.no_pool,
-            min_pool_docs=50,
-        )
+            if not query or not golds:
+                logger.warning("Skipping row %d: missing query or gold_campaign", i + 1)
+                continue
 
-        top_k_list = top_campaigns[:topc]
+            all_campaigns = run_retrieval(
+                query,
+                make,
+                model,
+                year,
+                indexes,
+                encoder,
+                mode=args.mode,
+                dense_topk=args.dense_topk,
+                keyword_topk=args.keyword_topk,
+                alpha=alpha,
+                use_pool_indexes=not args.no_pool,
+                min_pool_docs=50,
+            )
 
+            top10 = all_campaigns[:topc]
+            rank, hit_gold = _best_gold_rank(golds, all_campaigns)
+            status = _gold_status(rank, top_k=10)
+
+            if rank is None:
+                miss_count += 1
+            for k in k_values:
+                if any(g in top10[:k] for g in golds):
+                    hit_at[k] += 1
+
+            # Per-query debug
+            debug_row = {
+                "query": query,
+                "make": make,
+                "model": model,
+                "gold_campaign": golds[0] if len(golds) == 1 else golds,
+                "top10_predicted": top10[:10],
+                "gold_rank": rank,
+                "gold_hit": hit_gold,
+                "gold_status": status,
+                "gold_in_candidates": rank is not None,
+                "alpha": alpha,
+                "mode": args.mode,
+            }
+            debug_rows.append(debug_row)
+
+            print()
+            print(f"Query: {query}")
+            print(f"Gold: {golds}")
+            print(f"Top 10 predicted: {top10[:10]}")
+            print(f"First correct hit: {rank if rank else 'MISS'}")
+            print(f"Status: {status}")
+
+        n = len(queries)
+
+        # Summary section
+        print()
+        print("=" * 60)
+        print(f"Summary (mode={args.mode}, alpha={alpha})")
+        print("=" * 60)
+        print(f"Total queries: {n}")
+        print(f"Gold in top 1:  {hit_at[1]}")
+        print(f"Gold in top 3:  {hit_at[3]}")
+        print(f"Gold in top 5:  {hit_at[5]}")
+        print(f"Gold in top 10: {hit_at[10]}")
+        print(f"Total misses:   {miss_count}")
         for k in k_values:
-            if gold in top_k_list[:k]:
-                hit_at[k] += 1
+            recall = hit_at[k] / n if n > 0 else 0.0
+            print(f"Recall@{k}: {recall:.2f}")
+        print("=" * 60)
 
-        if args.verbose:
-            hit_1 = "YES" if gold in top_k_list[:1] else "NO"
-            hit_3 = "YES" if gold in top_k_list[:3] else "NO"
-            hit_5 = "YES" if gold in top_k_list[:5] else "NO"
-            hit_10 = "YES" if gold in top_k_list[:10] else "NO"
-            print(f"\nQuery: {query[:60]}{'...' if len(query) > 60 else ''}")
-            print(f"Gold: {gold}")
-            print(f"Top3: {top_k_list[:3]}")
-            print(f"Hit@1: {hit_1}  Hit@3: {hit_3}  Hit@5: {hit_5}  Hit@10: {hit_10}")
-
-    # Print final results
-    n = len(queries)
-    print()
-    print("=" * 50)
-    print("Evaluation Results")
-    print("=" * 50)
-    print(f"Total queries: {n}")
-    for k in k_values:
-        recall = hit_at[k] / n if n > 0 else 0.0
-        print(f"Recall@{k}: {recall:.2f}")
-    print("=" * 50)
+        # Save debug JSONL (one file per alpha when sweeping)
+        out_path = args.output
+        if len(alpha_values) > 1:
+            base, ext = os.path.splitext(args.output)
+            out_path = f"{base}_alpha{alpha:.2f}{ext}"
+        with open(out_path, "w", encoding="utf-8") as f:
+            for r in debug_rows:
+                f.write(json.dumps(r, ensure_ascii=False) + "\n")
+        logger.info("Wrote per-query debug to %s", out_path)
 
 
 if __name__ == "__main__":

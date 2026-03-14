@@ -1,6 +1,7 @@
 #!/bin/bash
 # Run retrieval evaluation: Recall@K over labeled test set.
-# Usage: ./scripts/run_eval.sh [--verbose]
+# Usage: ./scripts/run_eval.sh [--verbose] [--mode dense|keyword|hybrid]
+#        ./scripts/run_eval.sh --alpha-list 0.1,0.3,0.5,0.7
 # Run from project root.
 
 cd "$(dirname "$0")/.." && export PYTHONPATH=src
@@ -10,9 +11,7 @@ DENSE_TOPK=100
 KW_TOPK=150
 TOPC=10
 ALPHA=0.30
-
-VERBOSE=""
-[[ "$1" == "--verbose" ]] && VERBOSE="--verbose"
+MODE="${MODE:-hybrid}"
 
 python -m carrecall_rag.eval_retrieval \
   --eval-file "$EVAL_FILE" \
@@ -20,5 +19,5 @@ python -m carrecall_rag.eval_retrieval \
   --keyword-topk $KW_TOPK \
   --topc $TOPC \
   --alpha $ALPHA \
-  --hybrid \
-  $VERBOSE
+  --mode "$MODE" \
+  "$@"
