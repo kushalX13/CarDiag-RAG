@@ -108,6 +108,12 @@ def main() -> None:
         action="store_true",
         help="Enable debug logs and retrieval internals",
     )
+    parser.add_argument(
+        "--save-output",
+        type=str,
+        default="",
+        help="Optional file path to save final demo output",
+    )
     args = parser.parse_args()
 
     if not args.debug:
@@ -196,7 +202,15 @@ def main() -> None:
     if not results:
         logger.info("No results found.")
         answer = generate_rag_answer(query_text, [], top_k=args.topk)
-        print(answer)
+        final_output = "\n" + answer
+        print(final_output)
+        if args.save_output:
+            out_path = os.path.abspath(args.save_output)
+            out_dir = os.path.dirname(out_path)
+            if out_dir:
+                os.makedirs(out_dir, exist_ok=True)
+            with open(out_path, "w", encoding="utf-8") as f:
+                f.write(final_output.rstrip() + "\n")
         sys.exit(0)
 
     # Rerank with alpha=0.5 (hybrid)
@@ -217,9 +231,15 @@ def main() -> None:
 
     # Generate grounded RAG answer
     answer = generate_rag_answer(query_text, campaigns, top_k=args.topk)
-
-    print()
-    print(answer)
+    final_output = "\n" + answer
+    print(final_output)
+    if args.save_output:
+        out_path = os.path.abspath(args.save_output)
+        out_dir = os.path.dirname(out_path)
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
+        with open(out_path, "w", encoding="utf-8") as f:
+            f.write(final_output.rstrip() + "\n")
 
 
 if __name__ == "__main__":

@@ -1,0 +1,20 @@
+
+Possible Recall-Related Issue
+
+Query:
+fuel starvation HPFP failure
+
+Best Match:
+22V406000 — High Pressure Fuel Pump Failure
+
+Why It Matches:
+The high pressure fuel pump (HPFP) may fail, resulting in fuel starvation. This closely matches your query because it directly connects HPFP failure with fuel starvation and engine stall.
+
+Other Relevant Recall Candidates:
+  - 23V411000 — less directly related secondary candidate; Crankshaft Position Sensor Failure; may cause engine stall
+
+Safety Risk:
+Potential risks include engine stall and sudden loss of propulsion while driving, which may increase crash risk.
+
+Suggested Next Step:
+Contact your dealer to verify if your vehicle is affected, or look up your VIN at NHTSA.gov/recalls.
