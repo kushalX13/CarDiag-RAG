@@ -241,7 +241,6 @@ def search(
 
     ntotal = entry["index"].ntotal
     logger.info("Selected index: %s (%d docs) [%s]", index_name, ntotal, index_type)
-    print(f"Selected index: {index_name} ({ntotal} docs) [{index_type}]")
 
     faiss_index = entry["index"]
     docs = entry["docs"]

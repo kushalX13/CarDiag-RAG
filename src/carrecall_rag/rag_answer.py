@@ -76,6 +76,30 @@ def _truncate(text: str, max_len: int = 120) -> str:
     return cut + "..." if len(cut) < len(text) else cut
 
 
+def _clean_phrase(text: str) -> str:
+    """Clean extracted fragments into sentence-ready phrases."""
+    s = re.sub(r"\s+", " ", (text or "")).strip(" ,;:-")
+    # Drop dangling clause starters often caused by snippet clipping.
+    s = re.sub(r"\b(?:and|or|with|which|that|because|while|when|either|the|a)\s*$", "", s, flags=re.IGNORECASE)
+    # Drop very short trailing token likely clipped from source (e.g., 'fu').
+    m = re.search(r"\b([a-zA-Z]{1,2})$", s)
+    if m and not s.endswith(("3.0", "2.0")):
+        s = re.sub(r"\b[a-zA-Z]{1,2}$", "", s).strip(" ,;:-")
+    return s
+
+
+def _is_noisy_defect_phrase(text: str) -> bool:
+    """Detect low-quality extracted defect phrases and force safer fallback."""
+    t = (text or "").strip().lower()
+    if not t:
+        return True
+    noisy_starts = ("and ", "or ", "which ", "that ", "this ", "dealers ")
+    noisy_terms = ("dealers will", "inspect and replace", "is recalling", "certain ")
+    if t.startswith(noisy_starts):
+        return True
+    return any(x in t for x in noisy_terms)
+
+
 def _extract_defect_and_consequence(text: str) -> tuple[str, str]:
     """Extract (defect, consequence) separately for grammatical sentence building."""
     t = _strip_boilerplate(text)
@@ -90,6 +114,7 @@ def _extract_defect_and_consequence(text: str) -> tuple[str, str]:
         m = re.search(r"([\w\s]+(?:pump|sensor|module|latch|actuator|cable|cylinder))", t, re.IGNORECASE)
         if m:
             defect = re.sub(r"^\s*(?:the |a )\s*", "", m.group(1).strip(), flags=re.IGNORECASE)
+            defect = _clean_phrase(defect)
 
     # Consequence: what can happen
     for pat in [
@@ -107,7 +132,7 @@ def _extract_defect_and_consequence(text: str) -> tuple[str, str]:
             consequence = re.sub(r",?\s*increasing the[^.]*\.*$", ", which may increase crash risk", consequence, flags=re.IGNORECASE)
             consequence = re.sub(r",?\s*increasing the\s+", ", which may increase ", consequence, flags=re.IGNORECASE)
             consequence = re.sub(r"\s+", " ", consequence).strip()
-            consequence = _truncate(consequence, 90)
+            consequence = _clean_phrase(_truncate(consequence, 90))
             if len(consequence) > 8:
                 break
 
@@ -227,14 +252,50 @@ def _extract_relevance_note(
     # Candidate-specific description from its own evidence (never generic "engine-related" unless evidence supports it)
     specific = _extract_candidate_specific_desc(campaign)
 
-    # Low relevance: few query terms in this candidate, or significantly fewer than best
-    is_weak = overlap_this < 2 or (overlap_best > 0 and overlap_this < overlap_best * 0.5)
+    # Score relevance for filtering and note style.
+    relevance = _secondary_relevance_score(query, best_text, camp_text, overlap_best, overlap_this)
 
-    if is_weak:
-        return f"lower-confidence match; {specific}"
-    if overlap_this < overlap_best:
+    if relevance < 0.30:
+        return f"lower-confidence match; less directly related secondary candidate; {specific}"
+    if relevance < 0.55:
         return f"less directly related secondary candidate; {specific}"
     return specific
+
+
+def _secondary_relevance_score(
+    query: str,
+    best_text: str,
+    camp_text: str,
+    overlap_best: int,
+    overlap_this: int,
+) -> float:
+    """Heuristic relevance score for supporting candidates."""
+    q = (query or "").lower()
+
+    # Base overlap ratio.
+    overlap_ratio = overlap_this / max(1, len(set(re.findall(r"[a-z0-9]{3,}", q))))
+    relative_to_best = overlap_this / max(1, overlap_best)
+
+    # Shared issue-type signals (component/consequence).
+    issue_groups = [
+        {"fuel", "pump", "hpfp", "starvation", "diesel"},
+        {"brake", "booster", "cylinder", "fluid", "stopping"},
+        {"transmission", "park", "rollaway", "shift", "cable"},
+        {"airbag", "orc", "clock", "spring"},
+    ]
+    shared_issue = 0.0
+    for g in issue_groups:
+        if any(t in q for t in g) and any(t in camp_text for t in g):
+            shared_issue = 1.0
+            break
+
+    # Penalty for likely noisy candidates (e.g., lighting in brake/fuel query).
+    noise_terms = {"lamp", "lighting", "headlight", "tail lamp", "wiper", "seat trim"}
+    noisy = any(t in camp_text for t in noise_terms) and not any(t in q for t in noise_terms)
+    noise_penalty = 0.25 if noisy else 0.0
+
+    score = 0.45 * overlap_ratio + 0.35 * min(1.0, relative_to_best) + 0.20 * shared_issue - noise_penalty
+    return max(0.0, min(1.0, score))
 
 
 def _extract_safety_phrases(text: str) -> list[str]:
@@ -316,6 +377,8 @@ def _why_it_matches(query: str, campaign: dict) -> str:
         return "No detailed information available for this recall."
 
     defect, consequence = _extract_defect_and_consequence(combined)
+    if _is_noisy_defect_phrase(defect):
+        defect = ""
     if not defect:
         defect = _extract_short_title(campaign, 60)
 
@@ -327,6 +390,7 @@ def _why_it_matches(query: str, campaign: dict) -> str:
     if defect and consequence:
         # Avoid "can lead to may result in..." — consequence should be noun phrase
         cons_clean = re.sub(r"^(?:may|could|can)\s+(?:result in|cause|lead to)\s+", "", consequence, flags=re.IGNORECASE).strip()
+        cons_clean = _clean_phrase(cons_clean)
         first = f"{lead} may fail, resulting in {cons_clean}."
     elif defect:
         first = f"{lead} may be defective."
@@ -409,14 +473,38 @@ class TemplateAnswerBackend:
         best_cn = best.get("campaign_number", "")
         best_title = _extract_short_title(best)
         why = _why_it_matches(query, best)
-        other = [
-            (
-                c.get("campaign_number", ""),
-                _extract_short_reason(c),
-                _extract_relevance_note(c, best, query),
+        other_scored = []
+        for c in top[1:]:
+            best_parts = [(best.get("best_doc") or {}).get("text", "")]
+            best_parts.extend(e.get("snippet", "") for e in (best.get("evidence_snippets") or []))
+            best_text = " ".join(best_parts).lower()
+            camp_parts = [(c.get("best_doc") or {}).get("text", "")]
+            camp_parts.extend(e.get("snippet", "") for e in (c.get("evidence_snippets") or []))
+            camp_text = " ".join(camp_parts).lower()
+            q_words = set(re.findall(r"[a-z0-9]{3,}", (query or "").lower())) - {"the", "and", "for", "may", "can", "with", "into"}
+            overlap_best = sum(1 for w in q_words if w in best_text)
+            overlap_this = sum(1 for w in q_words if w in camp_text)
+            score = _secondary_relevance_score(query, best_text, camp_text, overlap_best, overlap_this)
+            other_scored.append(
+                (
+                    score,
+                    c.get("campaign_number", ""),
+                    _extract_short_reason(c),
+                    _extract_relevance_note(c, best, query),
+                )
             )
-            for c in top[1:]
-        ]
+
+        # Keep only reasonably related supports; allow at most one weak/noisy candidate last.
+        strong = [x for x in other_scored if x[0] >= 0.45]
+        weak = [x for x in other_scored if x[0] < 0.45]
+        strong.sort(key=lambda x: x[0], reverse=True)
+        weak.sort(key=lambda x: x[0], reverse=True)
+
+        selected = strong[:2]
+        if not selected and weak:
+            selected = [weak[0]]
+
+        other = [(cn, reason, note) for _, cn, reason, note in selected]
         safety_risk = _build_safety_risk_narrative(top, top_k)
         next_step = _suggest_next_step(top)
 

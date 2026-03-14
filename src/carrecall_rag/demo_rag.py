@@ -103,7 +103,19 @@ def main() -> None:
         default=10,
         help="Max phrases for rerank",
     )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Enable debug logs and retrieval internals",
+    )
     args = parser.parse_args()
+
+    if not args.debug:
+        # Keep demo output clean and user-facing by default.
+        logging.getLogger().setLevel(logging.WARNING)
+        logging.getLogger("carrecall_rag").setLevel(logging.WARNING)
+        logging.getLogger("sentence_transformers").setLevel(logging.WARNING)
+        logging.getLogger("transformers").setLevel(logging.WARNING)
 
     make_norm = normalize_make(args.make) if args.make else ""
     mkey = model_key(args.model) if args.model else ""
@@ -200,6 +212,7 @@ def main() -> None:
     campaigns = _aggregate_by_campaign_with_scores(
         results_for_agg,
         make_norm=make_norm if make_norm else None,
+        debug=args.debug,
     )
 
     # Generate grounded RAG answer

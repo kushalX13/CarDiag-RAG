@@ -45,6 +45,7 @@ def _build_query_from_context(make: str, model: str, year: int | None, query_tex
 def _aggregate_by_campaign_with_scores(
     results: list[tuple[dict, float, float, float]],
     make_norm: str | None,
+    debug: bool = False,
 ) -> list[dict]:
     """
     Group by campaign_number, use combined_score for campaign_score.
@@ -68,7 +69,7 @@ def _aggregate_by_campaign_with_scores(
     for cn, items in by_campaign.items():
         # Per campaign: max(combined) — "a campaign is as good as its best supporting snippet"
         combined_scores = [s[1] for s in items]  # s[1] = combined
-        if cn in ("22V406000", "18V332000"):
+        if debug and cn in ("22V406000", "18V332000"):
             print("DEBUG cn", cn, "hits", len(items),
                   "max_comb", max(combined_scores),
                   "sum_comb", sum(combined_scores))
@@ -300,6 +301,7 @@ def main() -> None:
     campaigns = _aggregate_by_campaign_with_scores(
         results_for_agg,
         make_norm=make_norm if make_norm else None,
+        debug=args.show_candidates,
     )
 
     # Print top campaigns
