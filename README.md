@@ -45,6 +45,14 @@ With custom seed:
 python -m carrecall_rag.bm25_sanity --n 30 --k 10 --seed 13
 ```
 
+3. **RAG demo** (Milestone 5: hybrid retrieval + grounded answer):
+
+```bash
+python -m carrecall_rag.demo_rag --make "Jeep" --model "Grand Cherokee" --query "fuel starvation HPFP failure"
+```
+
+Runs hybrid retrieval (alpha=0.5), prints top recall candidates and a template-based grounded explanation.
+
 ## Output Artifacts
 
 - `data/raw/complaints/` — raw JSON API responses (complaints)
