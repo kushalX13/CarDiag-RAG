@@ -121,7 +121,7 @@ def main() -> None:
     parser.add_argument(
         "--eval-file",
         type=str,
-        required=True,
+        default="eval/recall_queries.jsonl",
         help="JSONL file with query, make, model, gold_campaign per line",
     )
     parser.add_argument(

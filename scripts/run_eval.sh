@@ -5,7 +5,7 @@
 
 cd "$(dirname "$0")/.." && export PYTHONPATH=src
 
-EVAL_FILE="${EVAL_FILE:-data/eval/recall_queries.jsonl}"
+EVAL_FILE="${EVAL_FILE:-eval/recall_queries.jsonl}"
 DENSE_TOPK=100
 KW_TOPK=150
 TOPC=10
