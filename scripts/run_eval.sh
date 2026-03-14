@@ -10,7 +10,7 @@ EVAL_FILE="${EVAL_FILE:-eval/recall_queries.jsonl}"
 DENSE_TOPK=100
 KW_TOPK=150
 TOPC=10
-ALPHA=0.30
+ALPHA=0.50
 MODE="${MODE:-hybrid}"
 
 python -m carrecall_rag.eval_retrieval \

@@ -88,8 +88,19 @@ def rerank(
     normalize_dense: bool = False,
 ) -> list[tuple[dict, float, float, float]]:
     """
-    Rerank (doc, dense_score) by combined = (1-alpha)*dense + alpha*kw_norm.
-    If normalize_dense: scale dense to [0,1] so keyword-only docs (dense=0) can compete.
+    Rerank (doc, dense_score) by combined = (1-alpha)*dense_norm + alpha*kw_norm.
+
+    Score normalization (fusion audit):
+    - kw: TF-IDF + phrase boosts, then min-max over candidates -> kw_norm in [0,1]
+    - dense: raw FAISS cosine (typically 0.2-0.95) when normalize_dense=False;
+      min-max over candidates -> [0,1] when normalize_dense=True
+    - For hybrid: normalize_dense=True so both signals are [0,1] before fusion
+    - combined = (1-alpha)*dense_norm + alpha*kw_norm
+
+    Why alpha matters: dense recall is often weaker than keyword. At alpha=0.3,
+    combined = 0.7*dense + 0.3*kw -> dense dominates, underusing strong keyword signal.
+    At alpha=0.5, equal weight lets keyword lift ranking when dense misses.
+
     Returns [(doc, combined, dense_score, kw_norm), ...] sorted by combined desc.
     """
     if not results:

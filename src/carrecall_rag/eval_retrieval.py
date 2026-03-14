@@ -45,12 +45,13 @@ def run_retrieval(
     mode: RetrievalMode = "hybrid",
     dense_topk: int = 100,
     keyword_topk: int = 150,
-    alpha: float = 0.30,
+    alpha: float = 0.50,
     use_pool_indexes: bool = True,
     min_pool_docs: int = 50,
     rerank_tokens: int = 12,
     rerank_phrases: int = 10,
-) -> list[str]:
+    return_score_details: bool = False,
+) -> list[str] | tuple[list[str], list[dict]]:
     """
     Run retrieval pipeline: search (dense/keyword/hybrid) -> rerank -> aggregate.
     Returns list of campaign_numbers in rank order (top first).
@@ -116,12 +117,15 @@ def run_retrieval(
     )
 
     # Aggregate by campaign
-    campaigns = _aggregate_by_campaign_with_scores(
+    campaign_results = _aggregate_by_campaign_with_scores(
         results_for_agg,
         make_norm=make_norm if make_norm else None,
     )
+    campaigns = [c["campaign_number"] for c in campaign_results]
 
-    return [c["campaign_number"] for c in campaigns]
+    if return_score_details:
+        return campaigns, campaign_results
+    return campaigns
 
 
 def _parse_gold(row: dict) -> list[str]:
@@ -155,6 +159,74 @@ def _gold_status(rank: int | None, top_k: int = 10) -> str:
     if rank <= top_k:
         return f"rank {rank}"
     return f"in candidates but ranked low (rank {rank})"
+
+
+def _scores_for_campaign(campaign_result: dict) -> dict:
+    """Extract dense, keyword, fused from campaign's best doc."""
+    ev = (campaign_result.get("evidence_snippets") or [{}])[0]
+    return {
+        "dense": ev.get("dense_score", 0.0),
+        "keyword": ev.get("keyword_score", 0.0),
+        "fused": ev.get("combined", campaign_result.get("campaign_score", 0.0)),
+    }
+
+
+def _run_compare_table(
+    queries: list[dict],
+    indexes: dict,
+    encoder: SentenceTransformer | None,
+    args: argparse.Namespace,
+    k_values: list[int],
+) -> None:
+    """Run dense, keyword, hybrid@0.3/0.5/0.7 and print compact comparison table."""
+    configs = [
+        ("dense", "dense", 0.0),
+        ("keyword", "keyword", 0.0),
+        ("hybrid@0.3", "hybrid", 0.3),
+        ("hybrid@0.5", "hybrid", 0.5),
+        ("hybrid@0.7", "hybrid", 0.7),
+    ]
+    results: dict[str, dict[int, int]] = {}
+    valid_queries = [r for r in queries if r.get("query", "").strip() and _parse_gold(r)]
+    n = len(valid_queries)
+    if n == 0:
+        logger.error("No valid queries for comparison")
+        return
+
+    for label, mode, alpha in configs:
+        hit_at: dict[int, int] = defaultdict(int)
+        for row in valid_queries:
+            query = row.get("query", "").strip()
+            make = row.get("make", "")
+            model = row.get("model", "")
+            golds = _parse_gold(row)
+            year = row.get("year")
+            if not query or not golds:
+                continue
+            out = run_retrieval(
+                query, make, model, year, indexes, encoder,
+                mode=mode, dense_topk=args.dense_topk, keyword_topk=args.keyword_topk,
+                alpha=alpha, use_pool_indexes=not args.no_pool, min_pool_docs=50,
+            )
+            top10 = out[:10] if isinstance(out, list) else out[0][:10]
+            for k in k_values:
+                if any(g in top10[:k] for g in golds):
+                    hit_at[k] += 1
+        results[label] = hit_at
+
+    print()
+    print("=" * 70)
+    print("Comparison: Recall@K by mode and alpha")
+    print("=" * 70)
+    header = f"{'Config':<14} {'R@1':>6} {'R@3':>6} {'R@5':>6} {'R@10':>6}"
+    print(header)
+    print("-" * 40)
+    for label in [c[0] for c in configs]:
+        r = results[label]
+        denom = n if n > 0 else 1
+        line = f"{label:<14} {r[1]/denom:.2f}   {r[3]/denom:.2f}   {r[5]/denom:.2f}   {r[10]/denom:.2f}"
+        print(line)
+    print("=" * 70)
 
 
 def main() -> None:
@@ -201,7 +273,7 @@ def main() -> None:
     parser.add_argument(
         "--alpha",
         type=float,
-        default=0.30,
+        default=0.50,
         help="Weight for keyword in hybrid: combined = (1-alpha)*dense + alpha*kw_norm",
     )
     parser.add_argument(
@@ -237,6 +309,16 @@ def main() -> None:
         "--verbose",
         action="store_true",
         help="Extra verbose logging",
+    )
+    parser.add_argument(
+        "--show-scores",
+        action="store_true",
+        help="Print dense, keyword, fused scores for gold and top competing campaigns",
+    )
+    parser.add_argument(
+        "--compare-table",
+        action="store_true",
+        help="Run all modes + alpha sweep and print compact comparison table",
     )
     args = parser.parse_args()
 
@@ -293,9 +375,9 @@ def main() -> None:
         logger.error("Failed to load indexes from %s", args.cache_dir)
         sys.exit(1)
 
-    # Load encoder (not needed for keyword-only)
+    # Load encoder (not needed for keyword-only; required for --compare-table)
     encoder: SentenceTransformer | None = None
-    if args.mode != "keyword":
+    if args.mode != "keyword" or args.compare_table:
         if not os.path.exists(args.model_dir):
             logger.error("Model not found: %s. Run train_biencoder first.", args.model_dir)
             sys.exit(1)
@@ -306,6 +388,17 @@ def main() -> None:
 
     k_values = [1, 3, 5, 10]
     topc = max(args.topc, max(k_values))
+
+    # --compare-table: run all modes and alphas, print compact table
+    if args.compare_table:
+        _run_compare_table(
+            queries=queries,
+            indexes=indexes,
+            encoder=encoder,
+            args=args,
+            k_values=k_values,
+        )
+        return
 
     # Run for each alpha (sweep) or single alpha
     for alpha in alpha_values:
@@ -324,7 +417,7 @@ def main() -> None:
                 logger.warning("Skipping row %d: missing query or gold_campaign", i + 1)
                 continue
 
-            all_campaigns = run_retrieval(
+            out = run_retrieval(
                 query,
                 make,
                 model,
@@ -337,7 +430,13 @@ def main() -> None:
                 alpha=alpha,
                 use_pool_indexes=not args.no_pool,
                 min_pool_docs=50,
+                return_score_details=args.show_scores,
             )
+            campaign_results: list[dict] = []
+            if args.show_scores:
+                all_campaigns, campaign_results = out
+            else:
+                all_campaigns = out
 
             top10 = all_campaigns[:topc]
             rank, hit_gold = _best_gold_rank(golds, all_campaigns)
@@ -350,6 +449,10 @@ def main() -> None:
                     hit_at[k] += 1
 
             # Per-query debug
+            camp_scores: dict[str, dict] = {}
+            if args.show_scores and campaign_results:
+                camp_scores = {c["campaign_number"]: _scores_for_campaign(c) for c in campaign_results}
+
             debug_row = {
                 "query": query,
                 "make": make,
@@ -363,6 +466,10 @@ def main() -> None:
                 "alpha": alpha,
                 "mode": args.mode,
             }
+            if camp_scores:
+                debug_row["score_diagnostics"] = {
+                    cn: camp_scores.get(cn, {}) for cn in golds + top10[:5]
+                }
             debug_rows.append(debug_row)
 
             print()
@@ -371,6 +478,17 @@ def main() -> None:
             print(f"Top 10 predicted: {top10[:10]}")
             print(f"First correct hit: {rank if rank else 'MISS'}")
             print(f"Status: {status}")
+
+            if camp_scores:
+                to_show = list(golds)
+                for c in top10[:5]:
+                    if c not in to_show:
+                        to_show.append(c)
+                print("  Scores (dense, keyword, fused):")
+                for cn in to_show:
+                    s = camp_scores.get(cn, {"dense": 0, "keyword": 0, "fused": 0})
+                    marker = " [GOLD]" if cn in golds else ""
+                    print(f"    {cn}: dense={s['dense']:.4f} kw={s['keyword']:.4f} fused={s['fused']:.4f}{marker}")
 
         n = len(queries)
 
