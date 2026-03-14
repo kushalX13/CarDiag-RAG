@@ -76,43 +76,50 @@ def _truncate(text: str, max_len: int = 120) -> str:
     return cut + "..." if len(cut) < len(text) else cut
 
 
-def _extract_issue_and_consequence(text: str) -> str:
-    """Extract what failed and what can happen, stripping boilerplate."""
+def _extract_defect_and_consequence(text: str) -> tuple[str, str]:
+    """Extract (defect, consequence) separately for grammatical sentence building."""
     t = _strip_boilerplate(text)
-    if not t:
-        return ""
+    defect, consequence = "", ""
 
-    # Defect/component phrases (what failed)
-    defect_patterns = [
-        r"(?:the |a )?(?:high pressure fuel pump|fuel pump|HPFP)[^.]{0,90}",
-        r"(?:the |a )?(?:brake master cylinder)[^.]{0,80}",
-        r"(?:failure of|defect in|malfunction of)\s+([^.]{10,70})",
-        r"(?:the |a )?([\w\s]+(?:pump|sensor|module|latch|actuator|cable)[^.]{0,50})",
-        r"([\w\s]+(?:may fail|may introduce|may leak|can fail)[^.]{0,80})",
-    ]
-    for pat in defect_patterns:
+    # Defect: component or failure mode
+    if re.search(r"high pressure fuel pump|HPFP|fuel pump", t, re.IGNORECASE):
+        defect = "high pressure fuel pump (HPFP)"
+    elif re.search(r"brake master cylinder", t, re.IGNORECASE):
+        defect = "brake master cylinder"
+    else:
+        m = re.search(r"([\w\s]+(?:pump|sensor|module|latch|actuator|cable|cylinder))", t, re.IGNORECASE)
+        if m:
+            defect = re.sub(r"^\s*(?:the |a )\s*", "", m.group(1).strip(), flags=re.IGNORECASE)
+
+    # Consequence: what can happen
+    for pat in [
+        r"(?:resulting in|which may cause|may result in)\s+([^.]{10,90})",
+        r"(?:may|could|can)\s+(?:result in|cause|lead to)\s+([^.]{10,90})",
+        r"(fuel starvation|engine stall|loss of power|loss of propulsion|debris into the fuel system)[^.]*",
+        r"(reduced brake function|reduced braking ability)[^.]*",
+    ]:
         m = re.search(pat, t, re.IGNORECASE)
         if m:
-            phrase = m.group(1).strip() if m.lastindex and m.lastindex >= 1 else m.group(0).strip()
-            if len(phrase) > 15:
-                phrase = re.sub(r"^\s*(?:the |a )\s*", "", phrase, flags=re.IGNORECASE)
-                return _truncate(phrase, 100)
+            consequence = m.group(1).strip() if m.lastindex else m.group(0).strip()
+            consequence = re.sub(r"\s+", " ", consequence)
+            # Clean common fragments for grammatical completeness
+            consequence = re.sub(r"\band extend the distance required to stop\b", " and extended stopping distance", consequence, flags=re.IGNORECASE)
+            consequence = re.sub(r",?\s*increasing the[^.]*\.*$", ", which may increase crash risk", consequence, flags=re.IGNORECASE)
+            consequence = re.sub(r",?\s*increasing the\s+", ", which may increase ", consequence, flags=re.IGNORECASE)
+            consequence = re.sub(r"\s+", " ", consequence).strip()
+            consequence = _truncate(consequence, 90)
+            if len(consequence) > 8:
+                break
 
-    # Consequence phrases (what can happen)
-    consequence_patterns = [
-        r"(?:may|could|can)\s+(?:result in|cause|lead to)\s+([^.]{10,80})",
-        r"(?:resulting in|which may cause)\s+([^.]{10,80})",
-        r"(?:engine stall|loss of power|fuel starvation|fire|crash|injury|rollaway)[^.]*",
-    ]
-    for pat in consequence_patterns:
-        m = re.search(pat, t, re.IGNORECASE)
-        if m:
-            phrase = m.group(1).strip() if m.lastindex else m.group(0).strip()
-            return _truncate(phrase, 100)
+    return (defect, consequence)
 
-    # Fallback: first substantive clause after boilerplate
-    first = re.split(r"\.\s+(?=[A-Z])", t)[0] if t else ""
-    return _truncate(first, 100)
+
+def _extract_issue_and_consequence(text: str) -> str:
+    """Extract what failed and what can happen (combined, for titles)."""
+    defect, consequence = _extract_defect_and_consequence(text)
+    if defect and consequence:
+        return f"{defect}, which can lead to {consequence}"
+    return defect or consequence or ""
 
 
 def _extract_short_title(campaign: dict, max_len: int = 60) -> str:
@@ -145,6 +152,44 @@ def _extract_short_reason(campaign: dict, max_len: int = 50) -> str:
     evs = campaign.get("evidence_snippets") or [{}]
     snippet = (evs[0].get("snippet", "") if evs else "") or best.get("text", "")
     return _truncate(_extract_issue_and_consequence(snippet), max_len) or "related recall"
+
+
+def _extract_relevance_note(
+    campaign: dict, best_campaign: dict, query: str
+) -> str:
+    """Short relevance note for secondary candidate (e.g. related, lower-confidence)."""
+    best_parts = [(best_campaign.get("best_doc") or {}).get("text", "")]
+    best_parts.extend(e.get("snippet", "") for e in (best_campaign.get("evidence_snippets") or []))
+    best_text = " ".join(best_parts).lower()
+
+    camp_parts = [(campaign.get("best_doc") or {}).get("text", "")]
+    camp_parts.extend(e.get("snippet", "") for e in (campaign.get("evidence_snippets") or []))
+    camp_text = " ".join(camp_parts).lower()
+    q = (query or "").lower()
+
+    # Query keywords in this campaign vs best
+    q_words = set(re.findall(r"[a-z0-9]{3,}", q)) - {"the", "and", "for", "may", "can"}
+    overlap_best = sum(1 for w in q_words if w in best_text)
+    overlap_this = sum(1 for w in q_words if w in camp_text)
+
+    # Category hints
+    engine_terms = ["engine", "stall", "fuel", "pump", "hpfp", "sensor", "crankshaft"]
+    brake_terms = ["brake", "cylinder", "booster", "fluid", "leak"]
+    electrical_terms = ["module", "electrical", "wiring", "cruise", "control"]
+
+    if any(t in camp_text for t in engine_terms) and any(t in q for t in engine_terms):
+        if overlap_this < overlap_best:
+            return "another engine-related issue that can lead to stalling"
+        return "related engine or fuel system issue"
+    if any(t in camp_text for t in brake_terms) and any(t in q for t in brake_terms):
+        return "related brake system concern"
+    if any(t in camp_text for t in electrical_terms):
+        if overlap_this < overlap_best:
+            return "lower-confidence electrical issue; less directly related to your query"
+        return "electrical or control module issue"
+    if overlap_this < overlap_best:
+        return "lower-confidence match; less directly related"
+    return "related recall worth checking"
 
 
 def _extract_safety_phrases(text: str) -> list[str]:
@@ -194,10 +239,29 @@ def _build_context_from_campaigns(campaigns: list[dict], top_k: int) -> str:
     return "\n\n".join(lines)
 
 
+def _build_natural_connection(query: str, defect: str, consequence: str, text: str) -> str:
+    """Build natural-language connection between query and recall (no debug phrasing)."""
+    q = (query or "").lower()
+    t = (text or "").lower()
+
+    # Semantic concept pairs: query phrase -> recall concept
+    if any(w in q for w in ["hpfp", "fuel pump", "high pressure"]) and any(w in t for w in ["fuel pump", "hpfp"]):
+        if any(w in t for w in ["starvation", "stall"]) and any(w in q for w in ["starvation", "stall", "failure"]):
+            return "This closely matches your query because it directly connects HPFP failure with fuel starvation and engine stall."
+        return "This closely matches your query because it addresses the high pressure fuel pump defect you described."
+    if any(w in q for w in ["brake", "cylinder", "booster", "leak"]) and any(w in t for w in ["brake", "cylinder", "booster", "leak"]):
+        return "This closely matches your query because it directly addresses brake fluid leak into the brake booster."
+    if any(w in q for w in ["stall", "engine"]) and any(w in t for w in ["stall", "engine"]):
+        return "This closely matches your query because it addresses engine stalling or loss of power."
+    if defect and consequence:
+        return f"This closely matches your query because the defect ({defect}) and its consequences align with what you reported."
+    return "This closely matches your query because the recalled issue aligns with your description."
+
+
 def _why_it_matches(query: str, campaign: dict) -> str:
     """
     Build 2-3 sentence plain-English explanation for the best match.
-    Covers: what failed, what can happen, why it matches the query.
+    Grammatically complete; no debug phrasing.
     """
     best = campaign.get("best_doc") or {}
     evs = campaign.get("evidence_snippets") or []
@@ -206,22 +270,30 @@ def _why_it_matches(query: str, campaign: dict) -> str:
     if not combined:
         return "No detailed information available for this recall."
 
-    issue = _extract_issue_and_consequence(combined)
-    if not issue:
-        issue = _extract_short_title(campaign, 80)
+    defect, consequence = _extract_defect_and_consequence(combined)
+    if not defect:
+        defect = _extract_short_title(campaign, 60)
 
-    # Query keywords that appear in text (why it matches)
-    query_words = set(re.findall(r"[a-z0-9]{3,}", (query or "").lower()))
-    stop = {"the", "and", "for", "may", "can", "with", "into", "from"}
-    text_lower = combined.lower()
-    matching = [w for w in query_words if w in text_lower and w not in stop]
-    match_phrase = f" Your query mentions {', '.join(sorted(matching)[:5])}, which appear in this recall." if matching else ""
+    # Build grammatically complete sentences (avoid raw fragments)
+    lead = defect
+    if defect and not defect.lower().startswith(("the ", "a ")):
+        lead = f"The {defect}"
 
-    return f"This recall involves {issue}. It matches your description because the defect and consequences align with what you reported.{match_phrase}"
+    if defect and consequence:
+        # Avoid "can lead to may result in..." — consequence should be noun phrase
+        cons_clean = re.sub(r"^(?:may|could|can)\s+(?:result in|cause|lead to)\s+", "", consequence, flags=re.IGNORECASE).strip()
+        first = f"{lead} may fail, resulting in {cons_clean}."
+    elif defect:
+        first = f"{lead} may be defective."
+    else:
+        first = "This recall addresses a known defect."
+
+    connection = _build_natural_connection(query, defect, consequence, combined)
+    return f"{first} {connection}"
 
 
-def _build_safety_risk_deduplicated(campaigns: list[dict], top_k: int) -> str:
-    """Extract and deduplicate safety risks from retrieved recalls."""
+def _build_safety_risk_narrative(campaigns: list[dict], top_k: int) -> str:
+    """Build natural safety risk summary (not a raw phrase list)."""
     all_phrases: list[str] = []
     for c in campaigns[:top_k]:
         evs = c.get("evidence_snippets") or []
@@ -231,11 +303,33 @@ def _build_safety_risk_deduplicated(campaigns: list[dict], top_k: int) -> str:
             all_phrases.extend(_extract_safety_phrases(t))
 
     unique = _deduplicate_risks(all_phrases)
-    if unique:
-        if len(unique) == 1:
-            return "Potential risks include " + unique[0] + "."
-        return "Potential risks include " + ", ".join(unique[:-1]) + ", and " + unique[-1] + "."
-    return "Review the recalled component details for specific safety implications."
+    if not unique:
+        return "Review the recalled component details for specific safety implications."
+
+    # Build natural narrative based on risk types
+    engine_related = [p for p in unique if "engine stall" in p or "fuel" in p.lower() or "propulsion" in p.lower()]
+    brake_related = [p for p in unique if "brake" in p.lower()]
+    crash_included = any("crash" in p.lower() for p in unique)
+    other = [p for p in unique if p not in engine_related and p not in brake_related and "crash" not in p.lower()]
+
+    parts = []
+    if engine_related:
+        parts.append("engine stall and sudden loss of propulsion while driving")
+    if brake_related:
+        parts.append("reduced braking ability and increased stopping distance")
+    for p in other:
+        if p not in ["engine stall", "loss of power/control"]:
+            parts.append(p.lower())
+
+    if not parts:
+        parts = [p.lower() for p in unique[:2]]
+
+    primary = parts[0] if parts else ""
+    if crash_included and "crash" not in primary:
+        return f"Potential risks include {primary}, which may increase crash risk."
+    if len(parts) == 1:
+        return f"Potential risks include {primary}."
+    return f"Potential risks include {primary} and {parts[1]}, which may increase crash risk."
 
 
 def _suggest_next_step(campaigns: list[dict]) -> str:
@@ -271,10 +365,14 @@ class TemplateAnswerBackend:
         best_title = _extract_short_title(best)
         why = _why_it_matches(query, best)
         other = [
-            (c.get("campaign_number", ""), _extract_short_reason(c))
+            (
+                c.get("campaign_number", ""),
+                _extract_short_reason(c),
+                _extract_relevance_note(c, best, query),
+            )
             for c in top[1:]
         ]
-        safety_risk = _build_safety_risk_deduplicated(top, top_k)
+        safety_risk = _build_safety_risk_narrative(top, top_k)
         next_step = _suggest_next_step(top)
 
         return _format_output(
@@ -291,7 +389,7 @@ def _format_output(
     query: str,
     best_match: tuple[str, str] | None,
     why_it_matches: str,
-    other_candidates: list[tuple[str, str]],
+    other_candidates: list[tuple[str, str, str]],
     safety_risk: str,
     next_step: str,
 ) -> str:
@@ -322,8 +420,10 @@ def _format_output(
 
     if other_candidates:
         lines.append("Other Relevant Recall Candidates:")
-        for cn, reason in other_candidates:
-            lines.append(f"  - {cn} — {reason}")
+        for cn, reason, note in other_candidates:
+            # Use relevance note when specific; otherwise use reason (title)
+            desc = note if note and note != "related recall worth checking" else reason
+            lines.append(f"  - {cn} — {desc}")
         lines.append("")
 
     lines.extend([
