@@ -17,6 +17,14 @@
 
 Baseline: hybrid retrieval (α=0.5), no rerank. Test set: `eval/recall_queries.jsonl`.
 
+**Reproducibility** — Python 3.10+. From project root (with corpus and indexes in place, see [Install](#install) and Layout):
+
+```bash
+pip install -e . && ./scripts/run_eval.sh
+```
+
+The script prints Recall@1, Recall@10, and MRR in the **CV-ready metrics** block at the end. To regenerate corpus/indexes from scratch, run the corpus build and index build steps (see `src/carrecall_rag/build_corpus.py`, `retrieve.py`).
+
 ---
 
 ## Why this problem is hard
@@ -57,7 +65,7 @@ Corpus: `data/processed/corpus_merged.jsonl` (doc_id, campaign_number, make_norm
 | Model  | Grand Cherokee |
 | Query  | fuel starvation HPFP failure |
 
-**Illustrative output** (from the demo; format matches `demo_outputs/hpfp.txt`):
+**Illustrative output** (from the demo). Full example: [demo_outputs/hpfp.txt](demo_outputs/hpfp.txt).
 
 - **Best match:** 22V406000 — High Pressure Fuel Pump Failure  
 - **Why it matches:** The high pressure fuel pump (HPFP) may fail, resulting in fuel starvation. This closely matches your query because it directly connects HPFP failure with fuel starvation and engine stall.  
