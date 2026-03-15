@@ -119,15 +119,12 @@ carrecall-demo --make Jeep --model "Grand Cherokee" --query "fuel starvation HPF
 
 | What | Command |
 |------|---------|
-| **Demo** (hybrid) | `carrecall-demo --make Jeep --model "Grand Cherokee" --query "fuel starvation HPFP failure"` |
-| **Demo + rerank** | Add `--rerank --rerank-topn 50` to the above |
-| **Eval** (small 10-query benchmark) | `python -m carrecall_rag.eval --eval-file eval/recall_queries.jsonl --output eval/results/retrieval_debug.jsonl --mode hybrid --alpha 0.5 --dense-topk 100 --keyword-topk 150 --topc 10` |
-| **Eval** (script) | `./scripts/run_eval.sh` |
-| **Compare rerank formats** | `python -m carrecall_rag.eval --eval-file eval/recall_queries.jsonl --compare-table --dense-topk 100 --keyword-topk 150 --rerank-topn 50` |
-| **Compare methods** (dense/keyword/hybrid/rerank) | `python -m carrecall_rag.eval --eval-file eval/recall_queries.jsonl --compare-methods --compare-methods-output eval/results/comparison_methods.md` |
+| **Demo** | `carrecall-demo --make Jeep --model "Grand Cherokee" --query "fuel starvation HPFP failure"` |
+| **Eval** (small benchmark) | `python -m carrecall_rag.eval --eval-file eval/recall_queries.jsonl --output eval/results/retrieval_debug.jsonl` |
 | **Eval** (extended fixed benchmark) | `python -m carrecall_rag.eval --eval-file eval/recall_queries_100_fixed.jsonl --output eval/results/retrieval_debug_100_fixed.jsonl` |
 | **Eval** (hard benchmark) | `python -m carrecall_rag.eval --eval-file eval/recall_queries_hard.jsonl --output eval/results/retrieval_debug_hard.jsonl` |
-| **Failure analysis** | `python scripts/analyze_failures.py --input eval/results/retrieval_debug.jsonl --output-dir eval/results` |
+| **Eval** (script wrapper) | `./scripts/run_eval.sh` |
+| **Failure analysis** (optional) | `python scripts/analyze_failures.py --input eval/results/retrieval_debug.jsonl --output-dir eval/results` |
 
 Copy-paste:
 
@@ -135,21 +132,8 @@ Copy-paste:
 # Demo
 carrecall-demo --make Jeep --model "Grand Cherokee" --query "fuel starvation HPFP failure"
 
-# Demo with neural reranker
-carrecall-demo --make Jeep --model "Grand Cherokee" --query "fuel starvation HPFP failure" --rerank --rerank-topn 50
-
-# Evaluation (writes eval/results/retrieval_debug.jsonl)
-python -m carrecall_rag.eval \
-  --eval-file eval/recall_queries.jsonl \
-  --output eval/results/retrieval_debug.jsonl \
-  --mode hybrid --alpha 0.5 --dense-topk 100 --keyword-topk 150 --topc 10
-
-# Compare rerank text formats (no-rerank, full, compact, smart)
-python -m carrecall_rag.eval --eval-file eval/recall_queries.jsonl --compare-table \
-  --dense-topk 100 --keyword-topk 150 --rerank-topn 50
-
-# Compare retrieval methods (dense, keyword, hybrid, hybrid+rerank) — writes eval/results/comparison_methods.md
-python -m carrecall_rag.eval --eval-file eval/recall_queries.jsonl --compare-methods
+# Run evaluation on the small benchmark
+python -m carrecall_rag.eval --eval-file eval/recall_queries.jsonl --output eval/results/retrieval_debug.jsonl
 
 # Run evaluation on the extended fixed benchmark
 python -m carrecall_rag.eval --eval-file eval/recall_queries_100_fixed.jsonl --output eval/results/retrieval_debug_100_fixed.jsonl
@@ -190,12 +174,6 @@ python -m carrecall_rag.eval --eval-file eval/recall_queries_100_fixed.jsonl --o
 
 ```bash
 python -m carrecall_rag.eval --eval-file eval/recall_queries_hard.jsonl --output eval/results/retrieval_debug_hard.jsonl
-```
-
-**Method comparison** (dense vs keyword vs hybrid vs hybrid+rerank) with Recall@K, MRR, avg/median rank, miss count:
-
-```bash
-python -m carrecall_rag.eval --eval-file eval/recall_queries.jsonl --compare-methods --compare-methods-output eval/results/comparison_methods.md
 ```
 
 **Failure / error analysis:** After running eval, inspect missed or low-ranked queries:
