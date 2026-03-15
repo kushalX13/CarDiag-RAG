@@ -132,6 +132,7 @@ def main() -> None:
 
     make_norm = normalize_make(args.make) if args.make else ""
     mkey = model_key(args.model) if args.model else ""
+    vehicle_label = " ".join(x for x in [args.make.strip(), args.model.strip()] if x).strip()
 
     if args.query is not None:
         query_text = args.query
@@ -212,7 +213,7 @@ def main() -> None:
 
     if not candidates:
         logger.info("No results found.")
-        answer = generate_rag_answer(query_text, [], top_k=args.topk)
+        answer = generate_rag_answer(query_text, [], top_k=args.topk, vehicle=vehicle_label)
         final_output = "\n" + answer
         print(final_output)
         if args.save_output:
@@ -246,7 +247,7 @@ def main() -> None:
     )
 
     # Generate grounded RAG answer
-    answer = generate_rag_answer(query_text, campaigns, top_k=args.topk)
+    answer = generate_rag_answer(query_text, campaigns, top_k=args.topk, vehicle=vehicle_label)
     final_output = "\n" + answer
     print(final_output)
     if args.save_output:

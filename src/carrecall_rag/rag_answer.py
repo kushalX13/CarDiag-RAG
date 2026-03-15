@@ -38,7 +38,7 @@ Produce a response with these sections:
 class AnswerBackend(Protocol):
     """Protocol for answer generation backends."""
 
-    def generate(self, query: str, retrieved_docs: list[dict], top_k: int) -> str:
+    def generate(self, query: str, retrieved_docs: list[dict], top_k: int, vehicle: str = "") -> str:
         """Generate a grounded answer from query and retrieved docs."""
         ...
 
@@ -456,12 +456,19 @@ def _suggest_next_step(campaigns: list[dict]) -> str:
 class TemplateAnswerBackend:
     """Deterministic template-based answer generation. No LLM required."""
 
-    def generate(self, query: str, retrieved_docs: list[dict], top_k: int = 3) -> str:
+    def generate(
+        self,
+        query: str,
+        retrieved_docs: list[dict],
+        top_k: int = 3,
+        vehicle: str = "",
+    ) -> str:
         """Generate structured answer from retrieved campaign docs."""
         top = retrieved_docs[:top_k]
         if not top:
             return _format_output(
                 query=query,
+                vehicle=vehicle,
                 best_match=None,
                 why_it_matches="No recall candidates were retrieved for this query.",
                 other_candidates=[],
@@ -489,8 +496,7 @@ class TemplateAnswerBackend:
                 (
                     score,
                     c.get("campaign_number", ""),
-                    _extract_short_reason(c),
-                    _extract_relevance_note(c, best, query),
+                    _extract_short_title(c),
                 )
             )
 
@@ -504,12 +510,16 @@ class TemplateAnswerBackend:
         if not selected and weak:
             selected = [weak[0]]
 
-        other = [(cn, reason, note) for _, cn, reason, note in selected]
+        other = []
+        for score, cn, title in selected:
+            confidence = "lower-confidence" if score < 0.55 else "relevant"
+            other.append((cn, title, confidence))
         safety_risk = _build_safety_risk_narrative(top, top_k)
         next_step = _suggest_next_step(top)
 
         return _format_output(
             query=query,
+            vehicle=vehicle,
             best_match=(best_cn, best_title),
             why_it_matches=why,
             other_candidates=other,
@@ -520,6 +530,7 @@ class TemplateAnswerBackend:
 
 def _format_output(
     query: str,
+    vehicle: str,
     best_match: tuple[str, str] | None,
     why_it_matches: str,
     other_candidates: list[tuple[str, str, str]],
@@ -527,8 +538,12 @@ def _format_output(
     next_step: str,
 ) -> str:
     """Format the final RAG output (user-facing)."""
+    vehicle_line = vehicle.strip() if vehicle and vehicle.strip() else "Not specified"
     lines = [
         "Possible Recall-Related Issue",
+        "",
+        "Vehicle:",
+        vehicle_line,
         "",
         "Query:",
         query,
@@ -540,30 +555,29 @@ def _format_output(
             "Best Match:",
             f"{cn} — {title}",
             "",
-            "Why It Matches:",
+            "Why it matches:",
             why_it_matches,
             "",
         ])
     else:
         lines.extend([
-            "Why It Matches:",
+            "Why it matches:",
             why_it_matches,
             "",
         ])
 
     if other_candidates:
-        lines.append("Other Relevant Recall Candidates:")
-        for cn, reason, note in other_candidates:
-            # Use note when it's candidate-specific; otherwise use reason (title)
-            desc = reason if note in ("related recall", "related recall worth checking") else note
-            lines.append(f"  - {cn} — {desc}")
+        lines.append("Other relevant recall candidates:")
+        for cn, title, confidence in other_candidates:
+            suffix = " (lower-confidence)" if confidence == "lower-confidence" else ""
+            lines.append(f"- {cn} — {title}{suffix}")
         lines.append("")
 
     lines.extend([
-        "Safety Risk:",
+        "Potential safety risk:",
         safety_risk,
         "",
-        "Suggested Next Step:",
+        "Recommended next step:",
         next_step,
         "",
     ])
@@ -582,6 +596,7 @@ def generate_rag_answer(
     query: str,
     retrieved_docs: list[dict],
     top_k: int = 3,
+    vehicle: str = "",
     backend: AnswerBackend | None = None,
 ) -> str:
     """
@@ -598,7 +613,7 @@ def generate_rag_answer(
         Formatted string with candidates, grounded summary, safety risk, next step.
     """
     backend = backend or _DEFAULT_BACKEND
-    return backend.generate(query, retrieved_docs, top_k)
+    return backend.generate(query, retrieved_docs, top_k, vehicle=vehicle)
 
 
 def set_default_backend(backend: AnswerBackend) -> None:

@@ -158,6 +158,13 @@ def _best_gold_rank(golds: list[str], campaigns: list[str]) -> tuple[int | None,
     return best_rank, best_gold
 
 
+def _reciprocal_rank(rank: int | None) -> float:
+    """Reciprocal rank: 1/rank if gold found, else 0."""
+    if rank is None or rank < 1:
+        return 0.0
+    return 1.0 / rank
+
+
 def _gold_status(rank: int | None, top_k: int = 10) -> str:
     """Describe whether gold entered candidate set and where it ranked."""
     if rank is None:
@@ -555,6 +562,8 @@ def main() -> None:
     for alpha in alpha_values:
         hit_at: dict[int, int] = defaultdict(int)
         miss_count = 0
+        first_correct_ranks: list[int] = []  # 1-based ranks for avg/median (excludes misses)
+        reciprocal_ranks: list[float] = []   # for MRR (one per evaluated query, 0 if miss)
         debug_rows: list[dict] = []
 
         for i, row in enumerate(queries):
@@ -602,6 +611,16 @@ def main() -> None:
             for k in k_values:
                 if any(g in top10[:k] for g in golds):
                     hit_at[k] += 1
+
+            rr = _reciprocal_rank(rank)
+            reciprocal_ranks.append(rr)
+            if rank is not None:
+                first_correct_ranks.append(rank)
+
+            hit_at_1 = 1 if (rank is not None and rank <= 1) else 0
+            hit_at_3 = 1 if (rank is not None and rank <= 3) else 0
+            hit_at_5 = 1 if (rank is not None and rank <= 5) else 0
+            hit_at_10 = 1 if (rank is not None and rank <= 10) else 0
 
             # Per-query debug
             camp_scores: dict[str, dict] = {}
@@ -687,9 +706,17 @@ def main() -> None:
                 "query": query,
                 "make": make,
                 "model": model,
+                "gold_campaigns": golds,
                 "gold_campaign": golds[0] if len(golds) == 1 else golds,
+                "predicted_topk": top10[: max(k_values)],
                 "top10_predicted": top10[:10],
+                "first_correct_rank": rank if rank is not None else "MISS",
                 "gold_rank": rank,
+                "reciprocal_rank": rr,
+                "hit_at_1": hit_at_1,
+                "hit_at_3": hit_at_3,
+                "hit_at_5": hit_at_5,
+                "hit_at_10": hit_at_10,
                 "gold_hit": hit_gold,
                 "gold_status": status,
                 "gold_in_candidates": rank is not None,
@@ -833,6 +860,18 @@ def main() -> None:
                     )
 
         n = len(queries)
+        evaluated_n = len(debug_rows)
+        if evaluated_n == 0:
+            logger.warning("No evaluated queries for this alpha; skipping summary.")
+            continue
+
+        mrr = sum(reciprocal_ranks) / evaluated_n
+        avg_rank = sum(first_correct_ranks) / len(first_correct_ranks) if first_correct_ranks else float("nan")
+        median_rank = float("nan")
+        if first_correct_ranks:
+            sorted_ranks = sorted(first_correct_ranks)
+            mid = len(sorted_ranks) // 2
+            median_rank = sorted_ranks[mid] if len(sorted_ranks) % 2 else (sorted_ranks[mid - 1] + sorted_ranks[mid]) / 2.0
 
         # Summary section
         print()
@@ -842,16 +881,36 @@ def main() -> None:
             f"rerank={args.rerank}, rerank_topn={args.rerank_topn}, rerank_limit={args.rerank_limit})"
         )
         print("=" * 60)
-        print(f"Total queries: {n}")
+        print(f"Total queries (in file): {n}")
+        print(f"Evaluated queries:       {evaluated_n}")
         print(f"Gold in top 1:  {hit_at[1]}")
         print(f"Gold in top 3:  {hit_at[3]}")
         print(f"Gold in top 5:  {hit_at[5]}")
         print(f"Gold in top 10: {hit_at[10]}")
-        print(f"Total misses:   {miss_count}")
+        print(f"Failure / miss count:    {miss_count}")
         for k in k_values:
-            recall = hit_at[k] / n if n > 0 else 0.0
+            recall = hit_at[k] / evaluated_n
             print(f"Recall@{k}: {recall:.2f}")
+        # In this setup each query has one (or more) gold label; hit = any gold in top-k.
+        # So Hit@k and Recall@k are the same; we do not report them as separate metrics.
+        print("  (Hit@k = Recall@k here: one gold set per query, hit = any gold in top-k)")
+        print(f"MRR:                     {mrr:.4f}")
+        if first_correct_ranks:
+            print(f"Avg rank of 1st correct:   {avg_rank:.2f}")
+            print(f"Median rank of 1st correct: {median_rank:.2f}")
+        else:
+            print("Avg rank of 1st correct:   N/A (no hits)")
+            print("Median rank of 1st correct: N/A (no hits)")
         print("=" * 60)
+
+        # CV-ready metrics (concise numbers for reporting)
+        print()
+        print("--- CV-ready metrics ---")
+        print(f"  Recall@1:      {hit_at[1] / evaluated_n:.2f}")
+        print(f"  Recall@10:     {hit_at[10] / evaluated_n:.2f}")
+        print(f"  MRR:           {mrr:.4f}")
+        print(f"  Queries (n):   {evaluated_n}")
+        print("------------------------")
 
         # Save debug JSONL (one file per alpha when sweeping)
         out_path = args.output
