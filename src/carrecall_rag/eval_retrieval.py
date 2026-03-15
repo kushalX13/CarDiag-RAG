@@ -4,6 +4,7 @@ import argparse
 import json
 import logging
 import os
+import re
 import sys
 from collections import defaultdict
 
@@ -52,6 +53,7 @@ def run_retrieval(
     use_rerank: bool = False,
     reranker: NeuralReranker | None = None,
     rerank_limit: int = 0,
+    rerank_text_format: str = "full",
     return_score_details: bool = False,
 ) -> list[str] | tuple[list[str], list[dict], list[str], list[dict], list[dict]]:
     """
@@ -117,6 +119,7 @@ def run_retrieval(
         use_rerank=use_rerank,
         reranker=reranker,
         rerank_limit=rerank_limit,
+        text_format=rerank_text_format,
     )
 
     # Aggregate by campaign after stage-2 rerank (or same order when disabled)
@@ -220,6 +223,27 @@ def _moved_above_gold(
     return moved
 
 
+def _tokenize_terms(text: str) -> list[str]:
+    """Simple lexical terms for overlap diagnostics."""
+    toks = re.findall(r"[a-z0-9]+", (text or "").lower())
+    return [t for t in toks if len(t) >= 3]
+
+
+def _term_overlap(query: str, candidate_text: str) -> dict[str, list[str] | int]:
+    """Return overlap/missing query terms against candidate text."""
+    q_terms = sorted(set(_tokenize_terms(query)))
+    c_terms = set(_tokenize_terms(candidate_text))
+    overlap = [t for t in q_terms if t in c_terms]
+    missing = [t for t in q_terms if t not in c_terms]
+    return {
+        "query_terms": q_terms,
+        "overlap_terms": overlap,
+        "missing_terms": missing,
+        "overlap_count": len(overlap),
+        "missing_count": len(missing),
+    }
+
+
 def _run_compare_table(
     queries: list[dict],
     indexes: dict,
@@ -260,6 +284,7 @@ def _run_compare_table(
                 use_rerank=use_rerank,
                 reranker=reranker,
                 rerank_limit=rerank_limit,
+                rerank_text_format=args.rerank_text_format,
             )
             top10 = out[:10]
             for k in k_values:
@@ -349,6 +374,13 @@ def main() -> None:
         help="Batch size for neural reranking",
     )
     parser.add_argument(
+        "--rerank-text-format",
+        type=str,
+        choices=["full", "compact"],
+        default="full",
+        help="Text construction for reranker: full doc text or compact title+component+consequence",
+    )
+    parser.add_argument(
         "--rerank-limit",
         type=int,
         default=0,
@@ -364,6 +396,18 @@ def main() -> None:
         "--save-rerank-input-text",
         action="store_true",
         help="Save full candidate text passed to reranker in debug JSONL (can be large)",
+    )
+    parser.add_argument(
+        "--focus-query",
+        type=str,
+        default="",
+        help="Only print deep diagnostics for queries containing this substring",
+    )
+    parser.add_argument(
+        "--focus-campaigns",
+        type=str,
+        default="",
+        help="Comma-separated campaigns to print full reranker input text for",
     )
     parser.add_argument(
         "--alpha-list",
@@ -442,12 +486,13 @@ def main() -> None:
 
     logger.info("Loaded %d eval queries from %s", len(queries), args.eval_file)
     logger.info(
-        "Mode: %s | Alpha(s): %s | Rerank: %s | topN: %d | limit: %d",
+        "Mode: %s | Alpha(s): %s | Rerank: %s | topN: %d | limit: %d | text_format: %s",
         args.mode,
         alpha_values,
         args.rerank,
         args.rerank_topn,
         args.rerank_limit,
+        args.rerank_text_format,
     )
 
     # Load or build indexes
@@ -539,6 +584,7 @@ def main() -> None:
                 use_rerank=args.rerank,
                 reranker=reranker,
                 rerank_limit=args.rerank_limit,
+                rerank_text_format=args.rerank_text_format,
                 return_score_details=True,
             )
             all_campaigns, campaign_results, pre_campaigns, pre_candidates, ranked_docs = out
@@ -589,6 +635,7 @@ def main() -> None:
             for cn in sorted(promoted_union, key=lambda x: post_rank_map.get(x, 10**9)):
                 post = best_doc_post.get(cn, {})
                 pre = best_doc_pre.get(cn, {})
+                post_text = post.get("rerank_input_text", "") or ""
                 promoted_details.append({
                     "campaign_number": cn,
                     "pre_rank": pre_rank_map.get(cn),
@@ -600,12 +647,15 @@ def main() -> None:
                     "doc_id": (post.get("doc") or {}).get("doc_id", ""),
                     "input_char_len": post.get("rerank_input_char_len", 0),
                     "input_text_preview": (post.get("rerank_input_text", "") or "")[:240],
+                    "rerank_text_fields": post.get("rerank_text_fields", {}),
+                    "query_term_overlap": _term_overlap(query, post_text),
                 })
 
             gold_score_debug = []
             for gold in golds:
                 post = best_doc_post.get(gold, {})
                 pre = best_doc_pre.get(gold, {})
+                post_text = post.get("rerank_input_text", "") or ""
                 gold_score_debug.append({
                     "gold_campaign": gold,
                     "pre_rank": pre_rank_map.get(gold),
@@ -617,6 +667,8 @@ def main() -> None:
                     "doc_id": (post.get("doc") or {}).get("doc_id", ""),
                     "input_char_len": post.get("rerank_input_char_len", 0),
                     "input_text_preview": (post.get("rerank_input_text", "") or "")[:240],
+                    "rerank_text_fields": post.get("rerank_text_fields", {}),
+                    "query_term_overlap": _term_overlap(query, post_text),
                 })
 
             rerank_scope = args.rerank_limit if args.rerank_limit > 0 else args.rerank_topn
@@ -670,6 +722,7 @@ def main() -> None:
                     "rerank_score": item.get("rerank_score", 0.0),
                     "input_char_len": item.get("rerank_input_char_len", 0),
                     "input_text_preview": (item.get("rerank_input_text", "") or "")[:240],
+                    "rerank_text_fields": item.get("rerank_text_fields", {}),
                 }
                 for item in ranked_docs[: max(0, args.rerank_inspect_k)]
             ]
@@ -681,10 +734,34 @@ def main() -> None:
                         "stage1_rank": item.get("stage1_rank"),
                         "post_rerank_rank": item.get("post_rerank_rank"),
                         "input_char_len": item.get("rerank_input_char_len", 0),
+                        "rerank_text_fields": item.get("rerank_text_fields", {}),
                         "input_text": item.get("rerank_input_text", ""),
                     }
                     for item in ranked_docs[:rerank_scope]
                 ]
+
+            focus_campaigns = [
+                c.strip()
+                for c in (args.focus_campaigns or "").split(",")
+                if c.strip()
+            ]
+            focus_match = not args.focus_query or args.focus_query.lower() in query.lower()
+            if focus_match and focus_campaigns:
+                focus_dump = {}
+                for cn in focus_campaigns:
+                    row = best_doc_post.get(cn) or best_doc_pre.get(cn) or {}
+                    rtext = row.get("rerank_input_text", "") or ""
+                    focus_dump[cn] = {
+                        "campaign_number": cn,
+                        "pre_rank": pre_rank_map.get(cn),
+                        "post_rank": post_rank_map.get(cn),
+                        "rerank_score": row.get("rerank_score", 0.0),
+                        "doc_id": (row.get("doc") or {}).get("doc_id", ""),
+                        "rerank_text_fields": row.get("rerank_text_fields", {}),
+                        "query_term_overlap": _term_overlap(query, rtext),
+                        "rerank_input_text": rtext,
+                    }
+                debug_row["focus_campaign_inputs"] = focus_dump
             debug_rows.append(debug_row)
 
             print()
@@ -715,6 +792,11 @@ def main() -> None:
                         f"  {gsd['gold_campaign']} pre={gsd['pre_rank']} post={gsd['post_rank']} "
                         f"rerank={gsd['rerank_score']:.4f} len={gsd['input_char_len']}"
                     )
+                    qov = gsd.get("query_term_overlap", {})
+                    print(
+                        f"    overlap={qov.get('overlap_terms', [])[:8]} "
+                        f"missing={qov.get('missing_terms', [])[:8]}"
+                    )
             print(
                 "Rerank input stats: "
                 f"scored={rerank_input_stats['docs_scored']} "
@@ -722,6 +804,18 @@ def main() -> None:
                 f"max_len={rerank_input_stats['max_char_len']} "
                 f"long>2000={rerank_input_stats['long_docs_over_2000']}"
             )
+            if focus_match and focus_campaigns:
+                print("Focused campaign reranker inputs:")
+                for cn in focus_campaigns:
+                    row = best_doc_post.get(cn) or best_doc_pre.get(cn) or {}
+                    text = row.get("rerank_input_text", "") or ""
+                    fields = row.get("rerank_text_fields", {})
+                    qov = _term_overlap(query, text)
+                    print(f"  {cn} doc_id={(row.get('doc') or {}).get('doc_id', '')} rerank={row.get('rerank_score', 0.0):.4f}")
+                    print(f"    fields={fields}")
+                    print(f"    overlap={qov.get('overlap_terms', [])}")
+                    print(f"    missing={qov.get('missing_terms', [])}")
+                    print(f"    text={text}")
 
             if camp_scores:
                 to_show = list(golds)

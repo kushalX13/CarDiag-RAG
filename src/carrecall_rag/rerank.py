@@ -3,10 +3,84 @@
 from __future__ import annotations
 
 import logging
+import re
 
 from sentence_transformers import CrossEncoder
 
 logger = logging.getLogger(__name__)
+
+
+def _first_sentence(text: str, max_chars: int = 180) -> str:
+    """Best-effort first sentence extraction."""
+    text = (text or "").strip()
+    if not text:
+        return ""
+    m = re.search(r"[.!?]\s", text)
+    if m:
+        return text[: m.start() + 1][:max_chars].strip()
+    return text[:max_chars].strip()
+
+
+def _extract_consequence(text: str, max_chars: int = 220) -> str:
+    """Extract a likely consequence phrase from free text."""
+    t = (text or "").strip()
+    if not t:
+        return ""
+    patterns = [
+        r"(?:may|can|could)\s+(?:disable|increase|cause|result in|lead to)[^.]{0,220}",
+        r"(?:increasing|resulting in|leading to)[^.]{0,220}",
+    ]
+    tl = t.lower()
+    for p in patterns:
+        m = re.search(p, tl)
+        if m:
+            return t[m.start() : m.end()][:max_chars].strip(" ,.;")
+    return ""
+
+
+def _build_rerank_text(
+    doc: dict,
+    *,
+    text_format: str = "full",
+) -> tuple[str, dict]:
+    """
+    Build reranker input text and expose exact source fields used.
+
+    text_format:
+      - full: doc.text
+      - compact: title + component + consequence
+    """
+    text = (doc.get("text") or "").strip()
+    component = (doc.get("component") or "").strip()
+    consequence = (doc.get("consequence") or "").strip()
+    title = (doc.get("title") or doc.get("summary") or doc.get("subject") or "").strip()
+    if not title:
+        title = _first_sentence(text)
+    if not consequence:
+        consequence = _extract_consequence(text)
+
+    fields = {
+        "text_format": text_format,
+        "title": title,
+        "component": component,
+        "consequence": consequence,
+        "text_len": len(text),
+    }
+
+    if text_format == "compact":
+        parts = []
+        if title:
+            parts.append(f"Title: {title}")
+        if component:
+            parts.append(f"Component: {component}")
+        if consequence:
+            parts.append(f"Consequence: {consequence}")
+        compact = " | ".join(parts).strip()
+        if compact:
+            return compact, fields
+        return text, fields
+
+    return text, fields
 
 
 def _minmax_normalize(scores: list[float]) -> list[float]:
@@ -136,6 +210,7 @@ def rerank_candidates(
     use_rerank: bool,
     reranker: NeuralReranker | None,
     rerank_limit: int = 0,
+    text_format: str = "full",
     top_k: int | None = None,
 ) -> list[dict]:
     """
@@ -149,8 +224,9 @@ def rerank_candidates(
     ranked = [dict(c) for c in candidates]
     for i, c in enumerate(ranked):
         c["stage1_rank"] = i + 1
-        text = (c.get("doc") or {}).get("text", "") or ""
+        text, fields = _build_rerank_text(c.get("doc") or {}, text_format=text_format)
         c["rerank_input_char_len"] = len(text)
+        c["rerank_text_fields"] = fields
 
     if use_rerank and reranker is not None:
         limit = len(ranked)
@@ -159,6 +235,8 @@ def rerank_candidates(
 
         to_rerank = ranked[:limit]
         texts = [((c.get("doc") or {}).get("text", "") or "") for c in to_rerank]
+        if text_format:
+            texts = [_build_rerank_text((c.get("doc") or {}), text_format=text_format)[0] for c in to_rerank]
         rerank_scores = reranker.score(query, texts)
         for i, score in enumerate(rerank_scores):
             to_rerank[i]["rerank_score"] = score
