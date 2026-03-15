@@ -51,8 +51,9 @@ def run_retrieval(
     rerank_topn: int = 50,
     use_rerank: bool = False,
     reranker: NeuralReranker | None = None,
+    rerank_limit: int = 0,
     return_score_details: bool = False,
-) -> list[str] | tuple[list[str], list[dict], list[str]]:
+) -> list[str] | tuple[list[str], list[dict], list[str], list[dict], list[dict]]:
     """
     Run retrieval pipeline: search (dense/keyword/hybrid) -> rerank -> aggregate.
     Returns list of campaign_numbers in rank order (top first).
@@ -100,7 +101,7 @@ def run_retrieval(
     )
     if not candidates:
         if return_score_details:
-            return [], [], []
+            return [], [], [], [], []
         return []
 
     # Save stage-1 ranking (before optional stage-2 rerank)
@@ -115,6 +116,7 @@ def run_retrieval(
         candidates,
         use_rerank=use_rerank,
         reranker=reranker,
+        rerank_limit=rerank_limit,
     )
 
     # Aggregate by campaign after stage-2 rerank (or same order when disabled)
@@ -125,7 +127,7 @@ def run_retrieval(
     campaigns = [c["campaign_number"] for c in campaign_results]
 
     if return_score_details:
-        return campaigns, campaign_results, pre_campaigns
+        return campaigns, campaign_results, pre_campaigns, candidates, ranked_docs
     return campaigns
 
 
@@ -173,6 +175,51 @@ def _scores_for_campaign(campaign_result: dict) -> dict:
     }
 
 
+def _rank_map(campaigns: list[str]) -> dict[str, int]:
+    """Map campaign -> 1-based rank."""
+    return {c: i + 1 for i, c in enumerate(campaigns)}
+
+
+def _best_doc_by_campaign(rows: list[dict]) -> dict[str, dict]:
+    """Pick best supporting doc per campaign using rerank_score (fallback hybrid)."""
+    best: dict[str, dict] = {}
+    for row in rows:
+        cn = row.get("campaign_number", "")
+        if not cn:
+            continue
+        score = row.get("rerank_score", row.get("hybrid_score", 0.0))
+        if cn not in best:
+            best[cn] = row
+            continue
+        prev = best[cn].get("rerank_score", best[cn].get("hybrid_score", 0.0))
+        if score > prev:
+            best[cn] = row
+    return best
+
+
+def _moved_above_gold(
+    *,
+    gold: str,
+    pre_ranks: dict[str, int],
+    post_ranks: dict[str, int],
+) -> list[str]:
+    """
+    Campaigns that were below gold pre-rerank but moved above gold post-rerank.
+    """
+    pre_gold = pre_ranks.get(gold)
+    post_gold = post_ranks.get(gold)
+    if pre_gold is None or post_gold is None:
+        return []
+
+    moved = []
+    for campaign, post_rank in post_ranks.items():
+        pre_rank = pre_ranks.get(campaign, 10**9)
+        if pre_rank > pre_gold and post_rank < post_gold:
+            moved.append(campaign)
+    moved.sort(key=lambda c: post_ranks[c])
+    return moved
+
+
 def _run_compare_table(
     queries: list[dict],
     indexes: dict,
@@ -181,12 +228,12 @@ def _run_compare_table(
     args: argparse.Namespace,
     k_values: list[int],
 ) -> None:
-    """Run core retrieval variants and print compact comparison table."""
+    """Compare baseline vs rerank depths on hybrid retrieval."""
     configs = [
-        ("dense", "dense", 0.0, False),
-        ("keyword", "keyword", 0.0, False),
-        ("hybrid-only", "hybrid", 0.5, False),
-        ("hybrid+rerank", "hybrid", 0.5, True),
+        ("no-rerank", False, 0),
+        ("rerank-top10", True, 10),
+        ("rerank-top20", True, 20),
+        ("rerank-top50", True, 50),
     ]
     results: dict[str, dict[int, int]] = {}
     valid_queries = [r for r in queries if r.get("query", "").strip() and _parse_gold(r)]
@@ -195,7 +242,7 @@ def _run_compare_table(
         logger.error("No valid queries for comparison")
         return
 
-    for label, mode, alpha, use_rerank in configs:
+    for label, use_rerank, rerank_limit in configs:
         hit_at: dict[int, int] = defaultdict(int)
         for row in valid_queries:
             query = row.get("query", "").strip()
@@ -207,11 +254,14 @@ def _run_compare_table(
                 continue
             out = run_retrieval(
                 query, make, model, year, indexes, encoder,
-                mode=mode, dense_topk=args.dense_topk, keyword_topk=args.keyword_topk,
-                alpha=alpha, use_pool_indexes=not args.no_pool, min_pool_docs=50,
-                rerank_topn=args.rerank_topn, use_rerank=use_rerank, reranker=reranker,
+                mode="hybrid", dense_topk=args.dense_topk, keyword_topk=args.keyword_topk,
+                alpha=args.alpha, use_pool_indexes=not args.no_pool, min_pool_docs=50,
+                rerank_topn=max(args.rerank_topn, rerank_limit),
+                use_rerank=use_rerank,
+                reranker=reranker,
+                rerank_limit=rerank_limit,
             )
-            top10 = out[:10] if isinstance(out, list) else out[0][:10]
+            top10 = out[:10]
             for k in k_values:
                 if any(g in top10[:k] for g in golds):
                     hit_at[k] += 1
@@ -219,7 +269,7 @@ def _run_compare_table(
 
     print()
     print("=" * 70)
-    print("Comparison: Recall@K by retrieval stage")
+    print("Comparison: Hybrid baseline vs rerank depths")
     print("=" * 70)
     header = f"{'Config':<14} {'R@1':>6} {'R@3':>6} {'R@5':>6} {'R@10':>6}"
     print(header)
@@ -299,6 +349,23 @@ def main() -> None:
         help="Batch size for neural reranking",
     )
     parser.add_argument(
+        "--rerank-limit",
+        type=int,
+        default=0,
+        help="Limit how many stage-1 candidates get reranked (0 = rerank all in topN)",
+    )
+    parser.add_argument(
+        "--rerank-inspect-k",
+        type=int,
+        default=3,
+        help="Number of promoted candidates to print with reranker score + input text preview",
+    )
+    parser.add_argument(
+        "--save-rerank-input-text",
+        action="store_true",
+        help="Save full candidate text passed to reranker in debug JSONL (can be large)",
+    )
+    parser.add_argument(
         "--alpha-list",
         type=str,
         default=None,
@@ -335,12 +402,12 @@ def main() -> None:
     parser.add_argument(
         "--show-scores",
         action="store_true",
-        help="Print dense, keyword, fused scores for gold and top competing campaigns",
+        help="Print dense/keyword/hybrid/rerank scores for gold and competing campaigns",
     )
     parser.add_argument(
         "--compare-table",
         action="store_true",
-        help="Run dense, keyword, hybrid-only, hybrid+rerank comparison table",
+        help="Run no-rerank vs rerank-top10/20/50 comparison table",
     )
     args = parser.parse_args()
 
@@ -375,11 +442,12 @@ def main() -> None:
 
     logger.info("Loaded %d eval queries from %s", len(queries), args.eval_file)
     logger.info(
-        "Mode: %s | Alpha(s): %s | Rerank: %s | Rerank topN: %d",
+        "Mode: %s | Alpha(s): %s | Rerank: %s | topN: %d | limit: %d",
         args.mode,
         alpha_values,
         args.rerank,
         args.rerank_topn,
+        args.rerank_limit,
     )
 
     # Load or build indexes
@@ -470,14 +538,17 @@ def main() -> None:
                 rerank_topn=args.rerank_topn,
                 use_rerank=args.rerank,
                 reranker=reranker,
+                rerank_limit=args.rerank_limit,
                 return_score_details=True,
             )
-            all_campaigns, campaign_results, pre_campaigns = out
+            all_campaigns, campaign_results, pre_campaigns, pre_candidates, ranked_docs = out
 
             top10 = all_campaigns[:topc]
             rank, hit_gold = _best_gold_rank(golds, all_campaigns)
             status = _gold_status(rank, top_k=10)
             pre_rank, _ = _best_gold_rank(golds, pre_campaigns)
+            pre_rank_map = _rank_map(pre_campaigns)
+            post_rank_map = _rank_map(all_campaigns)
 
             if rank is None:
                 miss_count += 1
@@ -489,6 +560,75 @@ def main() -> None:
             camp_scores: dict[str, dict] = {}
             if args.show_scores and campaign_results:
                 camp_scores = {c["campaign_number"]: _scores_for_campaign(c) for c in campaign_results}
+
+            best_doc_post = _best_doc_by_campaign(ranked_docs)
+            best_doc_pre = _best_doc_by_campaign(pre_candidates)
+
+            gold_deltas = []
+            promoted_union: set[str] = set()
+            for gold in golds:
+                moved_above = _moved_above_gold(
+                    gold=gold,
+                    pre_ranks=pre_rank_map,
+                    post_ranks=post_rank_map,
+                )
+                promoted_union.update(moved_above)
+                gold_deltas.append({
+                    "gold_campaign": gold,
+                    "pre_rank": pre_rank_map.get(gold),
+                    "post_rank": post_rank_map.get(gold),
+                    "rank_delta": (
+                        None
+                        if pre_rank_map.get(gold) is None or post_rank_map.get(gold) is None
+                        else post_rank_map[gold] - pre_rank_map[gold]
+                    ),
+                    "moved_above_gold": moved_above,
+                })
+
+            promoted_details = []
+            for cn in sorted(promoted_union, key=lambda x: post_rank_map.get(x, 10**9)):
+                post = best_doc_post.get(cn, {})
+                pre = best_doc_pre.get(cn, {})
+                promoted_details.append({
+                    "campaign_number": cn,
+                    "pre_rank": pre_rank_map.get(cn),
+                    "post_rank": post_rank_map.get(cn),
+                    "dense_score": post.get("dense_score", pre.get("dense_score", 0.0)),
+                    "keyword_score": post.get("keyword_score", pre.get("keyword_score", 0.0)),
+                    "hybrid_score": post.get("hybrid_score", pre.get("hybrid_score", 0.0)),
+                    "rerank_score": post.get("rerank_score", 0.0),
+                    "doc_id": (post.get("doc") or {}).get("doc_id", ""),
+                    "input_char_len": post.get("rerank_input_char_len", 0),
+                    "input_text_preview": (post.get("rerank_input_text", "") or "")[:240],
+                })
+
+            gold_score_debug = []
+            for gold in golds:
+                post = best_doc_post.get(gold, {})
+                pre = best_doc_pre.get(gold, {})
+                gold_score_debug.append({
+                    "gold_campaign": gold,
+                    "pre_rank": pre_rank_map.get(gold),
+                    "post_rank": post_rank_map.get(gold),
+                    "dense_score": post.get("dense_score", pre.get("dense_score", 0.0)),
+                    "keyword_score": post.get("keyword_score", pre.get("keyword_score", 0.0)),
+                    "hybrid_score": post.get("hybrid_score", pre.get("hybrid_score", 0.0)),
+                    "rerank_score": post.get("rerank_score", 0.0),
+                    "doc_id": (post.get("doc") or {}).get("doc_id", ""),
+                    "input_char_len": post.get("rerank_input_char_len", 0),
+                    "input_text_preview": (post.get("rerank_input_text", "") or "")[:240],
+                })
+
+            rerank_scope = args.rerank_limit if args.rerank_limit > 0 else args.rerank_topn
+            scoped_rows = [r for r in ranked_docs if (r.get("stage1_rank") or 10**9) <= rerank_scope]
+            input_lens = [r.get("rerank_input_char_len", 0) for r in scoped_rows]
+            rerank_input_stats = {
+                "rerank_scope": rerank_scope,
+                "docs_scored": len(scoped_rows),
+                "avg_char_len": (sum(input_lens) / len(input_lens)) if input_lens else 0.0,
+                "max_char_len": max(input_lens) if input_lens else 0,
+                "long_docs_over_2000": sum(1 for n in input_lens if n > 2000),
+            }
 
             debug_row = {
                 "query": query,
@@ -504,15 +644,47 @@ def main() -> None:
                 "mode": args.mode,
                 "rerank_enabled": args.rerank,
                 "stage1_topn": args.rerank_topn,
+                "rerank_limit": args.rerank_limit,
                 "before_rerank_top10": pre_campaigns[:10],
                 "after_rerank_top10": top10[:10],
                 "gold_rank_before_rerank": pre_rank,
                 "gold_rank_after_rerank": rank,
+                "gold_deltas": gold_deltas,
+                "promoted_above_gold": promoted_details,
+                "gold_score_debug": gold_score_debug,
+                "rerank_input_stats": rerank_input_stats,
             }
             if camp_scores:
                 debug_row["score_diagnostics"] = {
                     cn: camp_scores.get(cn, {}) for cn in golds + top10[:5]
                 }
+            debug_row["reranker_inputs_top"] = [
+                {
+                    "campaign_number": item.get("campaign_number", ""),
+                    "doc_id": (item.get("doc") or {}).get("doc_id", ""),
+                    "stage1_rank": item.get("stage1_rank"),
+                    "post_rerank_rank": item.get("post_rerank_rank"),
+                    "dense_score": item.get("dense_score", 0.0),
+                    "keyword_score": item.get("keyword_score", 0.0),
+                    "hybrid_score": item.get("hybrid_score", 0.0),
+                    "rerank_score": item.get("rerank_score", 0.0),
+                    "input_char_len": item.get("rerank_input_char_len", 0),
+                    "input_text_preview": (item.get("rerank_input_text", "") or "")[:240],
+                }
+                for item in ranked_docs[: max(0, args.rerank_inspect_k)]
+            ]
+            if args.save_rerank_input_text:
+                debug_row["reranker_inputs_all"] = [
+                    {
+                        "campaign_number": item.get("campaign_number", ""),
+                        "doc_id": (item.get("doc") or {}).get("doc_id", ""),
+                        "stage1_rank": item.get("stage1_rank"),
+                        "post_rerank_rank": item.get("post_rerank_rank"),
+                        "input_char_len": item.get("rerank_input_char_len", 0),
+                        "input_text": item.get("rerank_input_text", ""),
+                    }
+                    for item in ranked_docs[:rerank_scope]
+                ]
             debug_rows.append(debug_row)
 
             print()
@@ -521,6 +693,35 @@ def main() -> None:
             print(f"Top 10 predicted: {top10[:10]}")
             print(f"First correct hit: {rank if rank else 'MISS'}")
             print(f"Status: {status}")
+            print("Gold rank changes:")
+            for gd in gold_deltas:
+                print(
+                    f"  {gd['gold_campaign']}: pre={gd['pre_rank']} post={gd['post_rank']} "
+                    f"delta={gd['rank_delta']} moved_above={gd['moved_above_gold'][:args.rerank_inspect_k]}"
+                )
+
+            if promoted_details:
+                print("Promoted above gold after rerank:")
+                for p in promoted_details[: max(0, args.rerank_inspect_k)]:
+                    print(
+                        f"  {p['campaign_number']} pre={p['pre_rank']} post={p['post_rank']} "
+                        f"rerank={p['rerank_score']:.4f} len={p['input_char_len']}"
+                    )
+
+            if gold_score_debug:
+                print("Gold reranker scores:")
+                for gsd in gold_score_debug:
+                    print(
+                        f"  {gsd['gold_campaign']} pre={gsd['pre_rank']} post={gsd['post_rank']} "
+                        f"rerank={gsd['rerank_score']:.4f} len={gsd['input_char_len']}"
+                    )
+            print(
+                "Rerank input stats: "
+                f"scored={rerank_input_stats['docs_scored']} "
+                f"avg_len={rerank_input_stats['avg_char_len']:.1f} "
+                f"max_len={rerank_input_stats['max_char_len']} "
+                f"long>2000={rerank_input_stats['long_docs_over_2000']}"
+            )
 
             if camp_scores:
                 to_show = list(golds)
@@ -543,7 +744,7 @@ def main() -> None:
         print("=" * 60)
         print(
             f"Summary (mode={args.mode}, alpha={alpha}, "
-            f"rerank={args.rerank}, rerank_topn={args.rerank_topn})"
+            f"rerank={args.rerank}, rerank_topn={args.rerank_topn}, rerank_limit={args.rerank_limit})"
         )
         print("=" * 60)
         print(f"Total queries: {n}")

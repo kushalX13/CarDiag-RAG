@@ -135,6 +135,7 @@ def rerank_candidates(
     *,
     use_rerank: bool,
     reranker: NeuralReranker | None,
+    rerank_limit: int = 0,
     top_k: int | None = None,
 ) -> list[dict]:
     """
@@ -146,16 +147,35 @@ def rerank_candidates(
         return []
 
     ranked = [dict(c) for c in candidates]
+    for i, c in enumerate(ranked):
+        c["stage1_rank"] = i + 1
+        text = (c.get("doc") or {}).get("text", "") or ""
+        c["rerank_input_char_len"] = len(text)
 
     if use_rerank and reranker is not None:
-        texts = [(c.get("doc") or {}).get("text", "") for c in ranked]
+        limit = len(ranked)
+        if rerank_limit > 0:
+            limit = min(limit, rerank_limit)
+
+        to_rerank = ranked[:limit]
+        texts = [((c.get("doc") or {}).get("text", "") or "") for c in to_rerank]
         rerank_scores = reranker.score(query, texts)
         for i, score in enumerate(rerank_scores):
-            ranked[i]["rerank_score"] = score
-        ranked.sort(key=lambda x: x.get("rerank_score", float("-inf")), reverse=True)
+            to_rerank[i]["rerank_score"] = score
+            to_rerank[i]["rerank_input_text"] = texts[i]
+
+        for c in ranked[limit:]:
+            c["rerank_score"] = c.get("hybrid_score", 0.0)
+            c["rerank_input_text"] = ""
+
+        ranked = sorted(to_rerank, key=lambda x: x.get("rerank_score", float("-inf")), reverse=True) + ranked[limit:]
     else:
         for c in ranked:
             c["rerank_score"] = c.get("hybrid_score", 0.0)
+            c["rerank_input_text"] = ""
+
+    for i, c in enumerate(ranked):
+        c["post_rerank_rank"] = i + 1
 
     if top_k is not None and top_k > 0:
         return ranked[:top_k]
