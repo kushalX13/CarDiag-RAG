@@ -16,43 +16,60 @@ Maps symptom descriptions (e.g. "brake fluid leaking from master cylinder") to N
 
 Corpus: `data/processed/corpus_merged.jsonl` (doc_id, campaign_number, make_norm, model_key, text). FAISS and BM25 built over it; pool/make indexes when enough docs.
 
-## Eval
+## Quick start
 
-- **Metrics:** Recall@1/@3/@5/@10, MRR, avg/median rank, miss count.
-- **Test set:** `eval/recall_queries.jsonl` — `query`, `make`, `model`, `gold_campaign`(s).
-- From project root: `pip install -e .` then run below (or `./scripts/run_eval.sh`).
+From project root after `pip install -e .`:
 
-| Metric   | Description |
-|----------|-------------|
-| Recall@K | Fraction of queries with gold in top-K |
-| MRR      | Mean of 1/rank for first correct (0 if miss) |
+```bash
+# Try the demo (one query → ranked recalls + short answer)
+carrecall-demo --make Jeep --model "Grand Cherokee" --query "fuel starvation HPFP failure"
 
-Baseline (hybrid α=0.5, no rerank) on current eval set: Recall@1 0.90, Recall@10 1.00, MRR 0.95 (n=10). See `eval/results/` for per-query output.
+# Run full evaluation (Recall@K, MRR over labeled set)
+./scripts/run_eval.sh
+```
 
 ## Commands
 
-**Demo (hybrid):**
+| What | Command |
+|------|---------|
+| **Demo** (hybrid) | `carrecall-demo --make Jeep --model "Grand Cherokee" --query "fuel starvation HPFP failure"` |
+| **Demo + rerank** | Add `--rerank --rerank-topn 50` to the above |
+| **Eval** (full) | `python -m carrecall_rag.eval --eval-file eval/recall_queries.jsonl --output eval/results/retrieval_debug.jsonl --mode hybrid --alpha 0.5 --dense-topk 100 --keyword-topk 150 --topc 10` |
+| **Eval** (script) | `./scripts/run_eval.sh` |
+| **Compare modes** | `python -m carrecall_rag.eval --eval-file eval/recall_queries.jsonl --compare-table --dense-topk 100 --keyword-topk 150 --rerank-topn 50` |
+
+Copy-paste examples:
+
 ```bash
+# Demo
 carrecall-demo --make Jeep --model "Grand Cherokee" --query "fuel starvation HPFP failure"
-```
 
-**With rerank:**
-```bash
+# Demo with neural reranker
 carrecall-demo --make Jeep --model "Grand Cherokee" --query "fuel starvation HPFP failure" --rerank --rerank-topn 50
-```
 
-**Eval:**
-```bash
+# Evaluation (writes eval/results/retrieval_debug.jsonl)
 python -m carrecall_rag.eval \
   --eval-file eval/recall_queries.jsonl \
   --output eval/results/retrieval_debug.jsonl \
   --mode hybrid --alpha 0.5 --dense-topk 100 --keyword-topk 150 --topc 10
+
+# Compare dense vs keyword vs hybrid vs hybrid+rerank
+python -m carrecall_rag.eval --eval-file eval/recall_queries.jsonl --compare-table \
+  --dense-topk 100 --keyword-topk 150 --rerank-topn 50
 ```
 
-**Compare modes:**
-```bash
-python -m carrecall_rag.eval --eval-file eval/recall_queries.jsonl --compare-table --dense-topk 100 --keyword-topk 150 --rerank-topn 50
-```
+## Evaluation
+
+- **Metrics:** Recall@1, @3, @5, @10 · MRR · avg/median rank · miss count  
+- **Test set:** `eval/recall_queries.jsonl` (fields: `query`, `make`, `model`, `gold_campaign` or `gold_campaigns`)  
+- **Output:** Per-query JSONL and logs under `eval/results/`
+
+| Metric | Meaning |
+|--------|--------|
+| Recall@K | Fraction of queries where a gold campaign appears in top-K |
+| MRR | Mean of 1/rank for first correct (0 if none in list) |
+
+**Baseline** (hybrid α=0.5, no rerank, current eval set): **Recall@1 0.90** · **Recall@10 1.00** · **MRR 0.95** (n=10).
 
 ## Layout
 
