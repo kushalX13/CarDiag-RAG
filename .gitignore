@@ -69,3 +69,6 @@ htmlcov/
 
 # Cursor
 .cursor/
+
+# Accidental cluster/output files (e.g. 2000=0)
+/[0-9]*=[0-9]*
