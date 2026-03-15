@@ -19,6 +19,7 @@ from .retrieve import (
     keyword_search,
     load_corpus,
     load_faiss_indexes,
+    normalize_retrieval_query,
     search,
 )
 from .utils import model_key, normalize_make
@@ -53,20 +54,30 @@ def main() -> None:
     parser.add_argument(
         "--dense-topk",
         type=int,
-        default=100,
+        default=400,
         help="Dense retrieval topk for hybrid",
     )
     parser.add_argument(
         "--keyword-topk",
         type=int,
-        default=100,
+        default=400,
         help="Keyword retrieval topk for hybrid",
+    )
+    parser.add_argument(
+        "--no-query-normalization",
+        action="store_true",
+        help="Disable retrieval query normalization and metadata stripping",
+    )
+    parser.add_argument(
+        "--no-query-expansion",
+        action="store_true",
+        help="Disable domain synonym expansion (ORC/airbag/clock spring)",
     )
     parser.add_argument(
         "--alpha",
         type=float,
-        default=0.50,
-        help="Stage-1 hybrid fusion weight: (1-alpha)*dense + alpha*keyword (default 0.50)",
+        default=0.80,
+        help="Stage-1 hybrid fusion weight: (1-alpha)*dense + alpha*keyword (default 0.8)",
     )
     parser.add_argument(
         "--model-dir",
@@ -143,7 +154,21 @@ def main() -> None:
         logger.error("No query text provided. Use --query or pipe to stdin.")
         sys.exit(1)
 
-    search_query = _build_query_from_context(args.make, args.model, args.year, query_text)
+    normalize_query = not args.no_query_normalization
+    expand_query = normalize_query and not args.no_query_expansion
+    normalized_query = (
+        normalize_retrieval_query(query_text, apply_expansion=expand_query)
+        if normalize_query
+        else query_text
+    )
+    search_query = _build_query_from_context(
+        args.make,
+        args.model,
+        args.year,
+        normalized_query,
+        normalize_query=False,
+        expand_query=False,
+    )
 
     indexes = load_faiss_indexes(args.cache_dir)
     if not indexes.get("global"):
@@ -184,7 +209,7 @@ def main() -> None:
     )
 
     keyword_results = keyword_search(
-        query_text,
+        normalized_query,
         make_norm,
         mkey,
         indexes,

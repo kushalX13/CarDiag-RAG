@@ -7,14 +7,16 @@
 cd "$(dirname "$0")/.." && export PYTHONPATH=src
 
 EVAL_FILE="${EVAL_FILE:-eval/recall_queries.jsonl}"
-DENSE_TOPK=100
-KW_TOPK=150
+OUTPUT="${OUTPUT:-eval/results/retrieval_debug.jsonl}"
+DENSE_TOPK=400
+KW_TOPK=400
 TOPC=10
-ALPHA=0.50
+ALPHA=0.80
 MODE="${MODE:-hybrid}"
 
 python -m carrecall_rag.eval \
   --eval-file "$EVAL_FILE" \
+  --output "$OUTPUT" \
   --dense-topk $DENSE_TOPK \
   --keyword-topk $KW_TOPK \
   --topc $TOPC \

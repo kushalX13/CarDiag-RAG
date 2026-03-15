@@ -15,6 +15,7 @@ from .retrieve import (
     keyword_search,
     load_corpus,
     load_faiss_indexes,
+    normalize_retrieval_query,
     search,
 )
 from .utils import model_key, normalize_make
@@ -27,9 +28,19 @@ DEFAULT_CORPUS_PATH = os.path.join(PROCESSED_DIR, "corpus_merged.jsonl")
 DEFAULT_CACHE_DIR = os.path.join(DATA_DIR, "indexes")
 
 
-def _build_query_from_context(make: str, model: str, year: int | None, query_text: str) -> str:
+def _build_query_from_context(
+    make: str,
+    model: str,
+    year: int | None,
+    query_text: str,
+    *,
+    normalize_query: bool = True,
+    expand_query: bool = True,
+) -> str:
     if not query_text.strip():
         return query_text
+    if normalize_query:
+        query_text = normalize_retrieval_query(query_text, apply_expansion=expand_query)
     parts = []
     if make or model:
         parts.append(f"{make} {model}".strip())
@@ -135,8 +146,8 @@ def main() -> None:
     parser.add_argument(
         "--alpha",
         type=float,
-        default=0.50,
-        help="Stage-1 hybrid fusion weight: (1-alpha)*dense + alpha*keyword (default 0.50)",
+        default=0.80,
+        help="Stage-1 hybrid fusion weight: (1-alpha)*dense + alpha*keyword (default 0.8)",
     )
     parser.add_argument(
         "--rerank",
@@ -174,14 +185,24 @@ def main() -> None:
     parser.add_argument(
         "--dense-topk",
         type=int,
-        default=100,
+        default=400,
         help="Dense retrieval topk when --hybrid",
     )
     parser.add_argument(
         "--keyword-topk",
         type=int,
-        default=100,
+        default=400,
         help="Keyword (BM25) retrieval topk when --hybrid",
+    )
+    parser.add_argument(
+        "--no-query-normalization",
+        action="store_true",
+        help="Disable retrieval query normalization and metadata stripping",
+    )
+    parser.add_argument(
+        "--no-query-expansion",
+        action="store_true",
+        help="Disable domain synonym expansion (ORC/airbag/clock spring)",
     )
     args = parser.parse_args()
 
@@ -199,7 +220,22 @@ def main() -> None:
         sys.exit(1)
 
     # Optionally add vehicle context to query
-    search_query = _build_query_from_context(args.make, args.model, args.year, query_text)
+    normalize_query = not args.no_query_normalization
+    expand_query = normalize_query and not args.no_query_expansion
+    normalized_query = (
+        normalize_retrieval_query(query_text, apply_expansion=expand_query)
+        if normalize_query
+        else query_text
+    )
+
+    search_query = _build_query_from_context(
+        args.make,
+        args.model,
+        args.year,
+        normalized_query,
+        normalize_query=False,
+        expand_query=False,
+    )
 
     # Load or build indexes
     indexes = load_faiss_indexes(args.cache_dir)
@@ -247,7 +283,7 @@ def main() -> None:
     keyword_results: list[tuple[dict, float]] = []
     if use_hybrid and keyword_topk > 0:
         keyword_results = keyword_search(
-            query_text,
+            normalized_query,
             make_norm,
             mkey,
             indexes,

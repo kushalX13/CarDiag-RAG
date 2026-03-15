@@ -19,6 +19,70 @@ def _bm25_tokenize(text: str) -> list[str]:
     text = (text or "").lower()
     return re.findall(r"[a-z0-9]+", text)
 
+
+METADATA_PREFIX_RE = re.compile(r"^\s*vehicle\s+description\s*:\s*", re.IGNORECASE)
+LEADING_METADATA_LABEL_RE = re.compile(
+    r"^\s*(passenger\s+vehicles|pickup\s+trucks|sport\s+utility\s+vehicles|"
+    r"passenger\s+cars|mini\s+vans|multi[-\s]?purpose\s+passenger\s+vehicle[s]?|"
+    r"multi[-\s]?purpose\s+vehicles?)\s*[\.:,-]?\s*",
+    re.IGNORECASE,
+)
+QUERY_EXPANSIONS: list[tuple[re.Pattern[str], list[str]]] = [
+    (
+        re.compile(r"\borc\b", re.IGNORECASE),
+        ["occupant restraint controller", "occupant restraint control module"],
+    ),
+    (
+        re.compile(r"\bair\s*bag[s]?\b|\bairbag[s]?\b", re.IGNORECASE),
+        ["supplemental restraint system", "occupant restraint system", "srs"],
+    ),
+    (
+        re.compile(r"\bclock\s*spring\b", re.IGNORECASE),
+        ["steering wheel clock spring", "steering column clock spring"],
+    ),
+]
+
+
+def normalize_retrieval_query(
+    query_text: str,
+    *,
+    apply_expansion: bool = True,
+) -> str:
+    """
+    Normalize retrieval queries with lightweight domain cleanup.
+    - lowercase + whitespace normalization
+    - strips leading metadata labels ("VEHICLE DESCRIPTION: ...")
+    - optional hand-written synonym expansion
+    """
+    raw = query_text or ""
+    normalized = " ".join(raw.strip().lower().split())
+    if not normalized:
+        return ""
+
+    normalized = METADATA_PREFIX_RE.sub("", normalized)
+    normalized = LEADING_METADATA_LABEL_RE.sub("", normalized)
+    normalized = normalized.strip(" .,:;-")
+    if not normalized:
+        normalized = " ".join(raw.strip().split()).lower()
+
+    if not apply_expansion:
+        return normalized
+
+    expanded_phrases: list[str] = []
+    existing = f" {normalized} "
+    for pattern, phrases in QUERY_EXPANSIONS:
+        if not pattern.search(normalized):
+            continue
+        for phrase in phrases:
+            token = f" {phrase.lower()} "
+            if token not in existing:
+                expanded_phrases.append(phrase)
+                existing += token
+
+    if expanded_phrases:
+        return f"{normalized} {' '.join(expanded_phrases)}".strip()
+    return normalized
+
 logger = logging.getLogger(__name__)
 
 

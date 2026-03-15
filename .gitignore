@@ -70,5 +70,15 @@ htmlcov/
 # Cursor
 .cursor/
 
+# Generated evaluation outputs (reproducible; do not commit)
+eval/results/*.jsonl
+eval/results/*.md
+eval/results/*.csv
+!eval/results/.gitkeep
+
+# Superseded benchmark drafts
+eval/recall_queries_100.jsonl
+eval/recall_queries_clean_100.jsonl
+
 # Accidental cluster/output files (e.g. 2000=0)
 /[0-9]*=[0-9]*

@@ -6,6 +6,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 from tqdm import tqdm
 
 from .config import MODELS, PROCESSED_DIR, RAW_COMPLAINTS_DIR, RAW_RECALLS_DIR
@@ -26,11 +27,36 @@ logger = logging.getLogger(__name__)
 RESOLUTION_REPORT_PATH = os.path.join(PROCESSED_DIR, "model_resolution_report.json")
 PULL_REPORT_PATH = os.path.join(PROCESSED_DIR, "pull_report.csv")
 
-# Recall text field candidates (NHTSA API)
-RECALL_TEXT_FIELDS = ["Summary", "Consequence", "Remedy", "Notes", "Defect", "Description"]
+# Recall text field candidates (NHTSA API). Order: defect/summary/consequence first to reduce metadata noise in chunks.
+RECALL_TEXT_FIELDS = ["Defect", "Summary", "Consequence", "Remedy", "Notes", "Description"]
 
 # Complaint narrative field candidates
 COMPLAINT_TEXT_FIELDS = ["summary", "Summary", "narrative", "Narrative"]
+
+# Leading metadata lines to strip from recall text (keep defect/summary/consequence content)
+METADATA_LINE_PATTERN = re.compile(
+    r"^\s*(VEHICLE DESCRIPTION\s*:?\s*|PASSENGER VEHICLES\s*\.?\s*|PICKUP TRUCKS\s*\.?\s*|"
+    r"PASSENGER CARS\s*\.?\s*|SPORT UTILITY VEHICLES\s*\.?\s*|MINI VANS\s*\.?\s*)$",
+    re.IGNORECASE,
+)
+
+
+def _strip_metadata_intro(text: str) -> str:
+    """Remove leading metadata-only lines (e.g. 'VEHICLE DESCRIPTION: PASSENGER VEHICLES.'). Preserves defect/summary/consequence content."""
+    if not text or not text.strip():
+        return text
+    lines = text.split("\n")
+    start = 0
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            start += 1
+            continue
+        if METADATA_LINE_PATTERN.match(stripped):
+            start += 1
+            continue
+        break
+    return normalize_whitespace("\n".join(lines[start:]))
 
 
 def _query_id(make: str, model: str, year: int, text: str) -> str:
@@ -241,6 +267,9 @@ def main() -> None:
             for rec in recalls:
                 doc_text = extract_best_text_fields(rec, RECALL_TEXT_FIELDS)
                 if not doc_text:
+                    continue
+                doc_text = _strip_metadata_intro(doc_text)
+                if not doc_text.strip():
                     continue
                 campaign = rec.get("NHTSACampaignNumber") or rec.get("CampaignNumber") or "unknown"
                 component = rec.get("Component") or ""

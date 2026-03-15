@@ -21,6 +21,7 @@ from .retrieve import (
     keyword_search,
     load_corpus,
     load_faiss_indexes,
+    normalize_retrieval_query,
     search,
 )
 from .utils import model_key, normalize_make
@@ -35,6 +36,27 @@ DEFAULT_CACHE_DIR = os.path.join(DATA_DIR, "indexes")
 RetrievalMode = str  # "dense" | "keyword" | "hybrid"
 
 
+def _apply_vehicle_boost(
+    candidates: list[dict],
+    make_norm: str,
+    mkey: str,
+    make_boost: float = 1.2,
+    model_boost: float = 1.1,
+) -> None:
+    """In-place: boost hybrid_score for docs matching query make/model, then re-sort by hybrid_score."""
+    for c in candidates:
+        doc = c.get("doc") or {}
+        doc_make = (doc.get("make_norm") or "").strip()
+        doc_model = (doc.get("model_key") or "").strip()
+        boost = 1.0
+        if make_norm and doc_make == make_norm:
+            boost *= make_boost
+        if mkey and doc_model == mkey:
+            boost *= model_boost
+        c["hybrid_score"] = (c.get("hybrid_score") or 0.0) * boost
+    candidates.sort(key=lambda x: x.get("hybrid_score") or 0.0, reverse=True)
+
+
 def run_retrieval(
     query_text: str,
     make: str,
@@ -44,23 +66,43 @@ def run_retrieval(
     encoder: SentenceTransformer | None,
     *,
     mode: RetrievalMode = "hybrid",
-    dense_topk: int = 100,
-    keyword_topk: int = 150,
-    alpha: float = 0.50,
+    dense_topk: int = 400,
+    keyword_topk: int = 400,
+    alpha: float = 0.80,
     use_pool_indexes: bool = True,
     min_pool_docs: int = 50,
+    pool_strategy: str = "boosted",
     rerank_topn: int = 50,
     use_rerank: bool = False,
     reranker: NeuralReranker | None = None,
     rerank_limit: int = 0,
     rerank_text_format: str = "full",
+    normalize_query: bool = True,
+    expand_query: bool = True,
     return_score_details: bool = False,
 ) -> list[str] | tuple[list[str], list[dict], list[str], list[dict], list[dict]]:
-    """Run search (dense/keyword/hybrid) -> optional rerank -> aggregate. Returns campaign_numbers in rank order."""
+    """Run search (dense/keyword/hybrid) -> optional rerank -> aggregate. Returns campaign_numbers in rank order.
+    pool_strategy: 'pool' = use pool/make indexes; 'global' = global index only; 'boosted' = global + vehicle score boosts.
+    """
     make_norm = normalize_make(make) if make else ""
     mkey = model_key(model) if model else ""
 
-    search_query = _build_query_from_context(make, model, year, query_text)
+    # pool_strategy: pool -> use pool indexes; global or boosted -> use global index only
+    use_pool = use_pool_indexes and (pool_strategy == "pool")
+
+    base_query = (
+        normalize_retrieval_query(query_text, apply_expansion=expand_query)
+        if normalize_query
+        else query_text
+    )
+    search_query = _build_query_from_context(
+        make,
+        model,
+        year,
+        base_query,
+        normalize_query=False,
+        expand_query=False,
+    )
 
     if mode == "keyword":
         dense_results = []
@@ -72,19 +114,19 @@ def run_retrieval(
             indexes,
             encoder,
             top_k=dense_topk,
-            use_pool_indexes=use_pool_indexes,
+            use_pool_indexes=use_pool,
             min_pool_docs=min_pool_docs,
         )
 
     keyword_results: list[tuple[dict, float]] = []
     if mode in ("hybrid", "keyword"):
         keyword_results = keyword_search(
-            query_text,
+            base_query,
             make_norm,
             mkey,
             indexes,
             top_k=keyword_topk,
-            use_pool_indexes=use_pool_indexes,
+            use_pool_indexes=use_pool,
             min_pool_docs=min_pool_docs,
         )
 
@@ -100,6 +142,10 @@ def run_retrieval(
         if return_score_details:
             return [], [], [], [], []
         return []
+
+    # Boosted strategy: global retrieval + score boost for vehicle match (make 1.2x, model 1.1x)
+    if pool_strategy == "boosted":
+        _apply_vehicle_boost(candidates, make_norm, mkey, make_boost=1.2, model_boost=1.1)
 
     # Save stage-1 ranking (before optional stage-2 rerank)
     pre_campaign_results = _aggregate_by_campaign_with_scores(
@@ -279,15 +325,18 @@ def _run_compare_table(
             year = row.get("year")
             if not query or not golds:
                 continue
+            pool_strategy = "global" if args.no_pool else getattr(args, "pool_strategy", "boosted")
             out = run_retrieval(
                 query, make, model, year, indexes, encoder,
                 mode="hybrid", dense_topk=args.dense_topk, keyword_topk=args.keyword_topk,
-                alpha=args.alpha, use_pool_indexes=not args.no_pool, min_pool_docs=50,
+                alpha=args.alpha, min_pool_docs=50, pool_strategy=pool_strategy,
                 rerank_topn=max(args.rerank_topn, rerank_limit_for_compare),
                 use_rerank=use_rerank,
                 reranker=reranker,
                 rerank_limit=rerank_limit_for_compare if use_rerank else 0,
                 rerank_text_format=text_format,
+                normalize_query=not args.no_query_normalization,
+                expand_query=(not args.no_query_normalization and not args.no_query_expansion),
             )
             top10 = out[:10]
             for k in k_values:
@@ -308,6 +357,200 @@ def _run_compare_table(
         line = f"{label:<14} {r[1]/denom:.2f}   {r[3]/denom:.2f}   {r[5]/denom:.2f}   {r[10]/denom:.2f}"
         print(line)
     print("=" * 70)
+
+
+def _run_compare_methods(
+    queries: list[dict],
+    indexes: dict,
+    encoder: SentenceTransformer | None,
+    reranker: NeuralReranker | None,
+    args: argparse.Namespace,
+    k_values: list[int],
+    output_path: str | None,
+) -> None:
+    """Compare retrieval methods: dense, keyword, hybrid, hybrid+rerank. Output table + optional file."""
+    valid_queries = [r for r in queries if r.get("query", "").strip() and _parse_gold(r)]
+    n = len(valid_queries)
+    if n == 0:
+        logger.error("No valid queries for method comparison")
+        return
+
+    # (method_label, mode, use_rerank)
+    configs = [
+        ("dense", "dense", False),
+        ("keyword", "keyword", False),
+        ("hybrid", "hybrid", False),
+        ("hybrid+rerank", "hybrid", True),
+    ]
+    rerank_limit = args.rerank_limit if args.rerank_limit > 0 else args.rerank_topn
+
+    rows: list[dict] = []
+    for label, mode, use_rerank in configs:
+        hit_at: dict[int, int] = defaultdict(int)
+        reciprocal_ranks: list[float] = []
+        first_correct_ranks: list[int] = []
+        for row in valid_queries:
+            query = row.get("query", "").strip()
+            make = row.get("make", "")
+            model = row.get("model", "")
+            golds = _parse_gold(row)
+            year = row.get("year")
+            if not query or not golds:
+                continue
+            pool_strategy = "global" if args.no_pool else getattr(args, "pool_strategy", "boosted")
+            out = run_retrieval(
+                query, make, model, year, indexes, encoder,
+                mode=mode,
+                dense_topk=args.dense_topk,
+                keyword_topk=args.keyword_topk,
+                alpha=args.alpha,
+                min_pool_docs=50,
+                pool_strategy=pool_strategy,
+                rerank_topn=args.rerank_topn,
+                use_rerank=use_rerank,
+                reranker=reranker,
+                rerank_limit=rerank_limit if use_rerank else 0,
+                rerank_text_format=args.rerank_text_format,
+                normalize_query=not args.no_query_normalization,
+                expand_query=(not args.no_query_normalization and not args.no_query_expansion),
+            )
+            top10 = out[:10]
+            rank, _ = _best_gold_rank(golds, out)
+            for k in k_values:
+                if any(g in top10[:k] for g in golds):
+                    hit_at[k] += 1
+            rr = _reciprocal_rank(rank)
+            reciprocal_ranks.append(rr)
+            if rank is not None:
+                first_correct_ranks.append(rank)
+        miss_count = n - len(first_correct_ranks)
+        mrr = sum(reciprocal_ranks) / n if n else 0.0
+        avg_rank = sum(first_correct_ranks) / len(first_correct_ranks) if first_correct_ranks else float("nan")
+        sorted_ranks = sorted(first_correct_ranks) if first_correct_ranks else []
+        mid = len(sorted_ranks) // 2
+        median_rank = (
+            float(sorted_ranks[mid]) if len(sorted_ranks) % 2
+            else (sorted_ranks[mid - 1] + sorted_ranks[mid]) / 2.0
+        ) if sorted_ranks else float("nan")
+        rows.append({
+            "method": label,
+            "Recall@1": hit_at[1] / n,
+            "Recall@3": hit_at[3] / n,
+            "Recall@5": hit_at[5] / n,
+            "Recall@10": hit_at[10] / n,
+            "MRR": mrr,
+            "avg_rank": avg_rank,
+            "median_rank": median_rank,
+            "miss_count": miss_count,
+        })
+
+    # Print table
+    print()
+    print("=" * 80)
+    print("Method comparison (n=%d queries)" % n)
+    print("=" * 80)
+    header = f"{'Method':<16} {'R@1':>6} {'R@3':>6} {'R@5':>6} {'R@10':>6} {'MRR':>6} {'AvgR':>6} {'MedR':>6} {'Miss':>5}"
+    print(header)
+    print("-" * 80)
+    for r in rows:
+        avg = r["avg_rank"]
+        med = r["median_rank"]
+        avg_s = f"{avg:.1f}" if not (avg != avg) else "N/A"
+        med_s = f"{med:.1f}" if not (med != med) else "N/A"
+        line = (
+            f"{r['method']:<16} "
+            f"{r['Recall@1']:.2f}   {r['Recall@3']:.2f}   {r['Recall@5']:.2f}   {r['Recall@10']:.2f}   "
+            f"{r['MRR']:.2f}   {avg_s:>6} {med_s:>6} {r['miss_count']:>5}"
+        )
+        print(line)
+    print("=" * 80)
+
+    if output_path:
+        os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+        if output_path.endswith(".csv"):
+            with open(output_path, "w", encoding="utf-8") as f:
+                f.write("method,Recall@1,Recall@3,Recall@5,Recall@10,MRR,avg_rank,median_rank,miss_count\n")
+                for r in rows:
+                    f.write(
+                        f"{r['method']},{r['Recall@1']:.4f},{r['Recall@3']:.4f},{r['Recall@5']:.4f},"
+                        f"{r['Recall@10']:.4f},{r['MRR']:.4f},{r['avg_rank']:.2f},{r['median_rank']:.2f},{r['miss_count']}\n"
+                    )
+        else:
+            with open(output_path, "w", encoding="utf-8") as f:
+                f.write("# Method comparison (n=%d queries)\n\n" % n)
+                f.write("| Method | Recall@1 | Recall@3 | Recall@5 | Recall@10 | MRR | Avg rank | Median rank | Miss |\n")
+                f.write("|--------|---------|----------|----------|-----------|-----|----------|-------------|------|\n")
+                for r in rows:
+                    avg_s = f"{r['avg_rank']:.2f}" if r["avg_rank"] == r["avg_rank"] else "N/A"
+                    med_s = f"{r['median_rank']:.2f}" if r["median_rank"] == r["median_rank"] else "N/A"
+                    f.write(
+                        f"| {r['method']} | {r['Recall@1']:.2f} | {r['Recall@3']:.2f} | {r['Recall@5']:.2f} | "
+                        f"{r['Recall@10']:.2f} | {r['MRR']:.2f} | {avg_s} | {med_s} | {r['miss_count']} |\n"
+                    )
+        logger.info("Wrote method comparison to %s", output_path)
+
+
+def _run_compare_pool(
+    queries: list[dict],
+    indexes: dict,
+    encoder: SentenceTransformer | None,
+    reranker: NeuralReranker | None,
+    args: argparse.Namespace,
+    k_values: list[int],
+) -> None:
+    """Compare pool (make+model) vs global-only index. Prints table: index_type | Recall@1 | Recall@10 | MRR."""
+    valid_queries = [r for r in queries if r.get("query", "").strip() and _parse_gold(r)]
+    n = len(valid_queries)
+    if n == 0:
+        logger.error("No valid queries for pool comparison")
+        return
+
+    results: list[tuple[str, float, float, float]] = []
+    for use_pool, label in [(True, "pool"), (False, "global")]:
+        hit_at: dict[int, int] = defaultdict(int)
+        reciprocal_ranks: list[float] = []
+        for row in valid_queries:
+            query = row.get("query", "").strip()
+            make = row.get("make", "")
+            model = row.get("model", "")
+            golds = _parse_gold(row)
+            year = row.get("year")
+            if not query or not golds:
+                continue
+            out = run_retrieval(
+                query, make, model, year, indexes, encoder,
+                mode=args.mode,
+                dense_topk=args.dense_topk,
+                keyword_topk=args.keyword_topk,
+                alpha=args.alpha,
+                min_pool_docs=50,
+                pool_strategy=label,
+                rerank_topn=args.rerank_topn,
+                use_rerank=args.rerank,
+                reranker=reranker,
+                rerank_limit=args.rerank_limit if args.rerank_limit > 0 else args.rerank_topn,
+                rerank_text_format=args.rerank_text_format,
+                normalize_query=not args.no_query_normalization,
+                expand_query=(not args.no_query_normalization and not args.no_query_expansion),
+            )
+            top10 = out[:10]
+            rank, _ = _best_gold_rank(golds, out)
+            for k in k_values:
+                if any(g in top10[:k] for g in golds):
+                    hit_at[k] += 1
+            reciprocal_ranks.append(_reciprocal_rank(rank))
+        mrr = sum(reciprocal_ranks) / n if n else 0.0
+        results.append((label, hit_at[1] / n, hit_at[10] / n, mrr))
+
+    print()
+    print("=" * 55)
+    print("Pool vs global index (n=%d queries, mode=%s)" % (n, args.mode))
+    print("=" * 55)
+    print(f"{'Index':<10} {'Recall@1':>10} {'Recall@10':>10} {'MRR':>10}")
+    print("-" * 55)
+    for label, r1, r10, mrr in results:
+        print(f"{label:<10} {r1:>10.2f} {r10:>10.2f} {mrr:>10.4f}")
+    print("=" * 55)
 
 
 def main() -> None:
@@ -336,14 +579,14 @@ def main() -> None:
     parser.add_argument(
         "--dense-topk",
         type=int,
-        default=100,
-        help="Dense retrieval topk",
+        default=400,
+        help="Dense retrieval topk (default 400 for stronger candidate recall)",
     )
     parser.add_argument(
         "--keyword-topk",
         type=int,
-        default=150,
-        help="Keyword (BM25) retrieval topk",
+        default=400,
+        help="Keyword (BM25) retrieval topk (default 400 for stronger candidate recall)",
     )
     parser.add_argument(
         "--topc",
@@ -354,8 +597,8 @@ def main() -> None:
     parser.add_argument(
         "--alpha",
         type=float,
-        default=0.50,
-        help="Stage-1 hybrid fusion weight: (1-alpha)*dense + alpha*keyword",
+        default=0.80,
+        help="Stage-1 hybrid fusion weight: (1-alpha)*dense + alpha*keyword (default 0.8)",
     )
     parser.add_argument("--rerank", action="store_true", help="Enable stage-2 neural reranking")
     parser.add_argument(
@@ -368,7 +611,7 @@ def main() -> None:
         "--rerank-model",
         type=str,
         default="cross-encoder/ms-marco-MiniLM-L-6-v2",
-        help="Cross-encoder model name/path for stage-2 reranking",
+        help="Cross-encoder for reranking. Examples: cross-encoder/ms-marco-MiniLM-L-6-v2 (default), cross-encoder/ms-marco-MiniLM-L-12-v2, BAAI/bge-reranker-base",
     )
     parser.add_argument(
         "--rerank-batch-size",
@@ -419,10 +662,27 @@ def main() -> None:
         help="Comma-separated alphas for sweep (e.g. 0.1,0.3,0.5,0.7). Only for mode=hybrid.",
     )
     parser.add_argument(
+        "--alpha-sweep",
+        action="store_true",
+        help="Run evaluation for alpha=0.5,0.6,0.7,0.8,0.9 and print table: alpha | Recall@1 | Recall@10 | MRR",
+    )
+    parser.add_argument(
         "--model-dir",
         type=str,
         default=DEFAULT_MODEL_DIR,
-        help="Path to biencoder model",
+        help="Path to biencoder model (default). Ignored if --encoder-model is set.",
+    )
+    parser.add_argument(
+        "--encoder-model",
+        type=str,
+        default=None,
+        help="Encoder: path to local model dir or HuggingFace name. Overrides --model-dir.",
+    )
+    parser.add_argument(
+        "--dense-model",
+        type=str,
+        default=None,
+        help="Dense embedding model: path or HF name (e.g. BAAI/bge-small-en-v1.5, BAAI/bge-base-en-v1.5, intfloat/e5-base-v2). Overrides --encoder-model and --model-dir.",
     )
     parser.add_argument(
         "--corpus-path",
@@ -439,7 +699,24 @@ def main() -> None:
     parser.add_argument(
         "--no-pool",
         action="store_true",
-        help="Force global index (disable pool/make indexes)",
+        help="Force global index (same as --pool-strategy global)",
+    )
+    parser.add_argument(
+        "--pool-strategy",
+        type=str,
+        choices=["pool", "global", "boosted"],
+        default="boosted",
+        help="pool=use make+model pool then make then global; global=global index only; boosted=global + vehicle score boost (default)",
+    )
+    parser.add_argument(
+        "--no-query-normalization",
+        action="store_true",
+        help="Disable retrieval query normalization and metadata stripping",
+    )
+    parser.add_argument(
+        "--no-query-expansion",
+        action="store_true",
+        help="Disable domain synonym expansion (ORC/airbag/clock spring)",
     )
     parser.add_argument(
         "--verbose",
@@ -456,6 +733,22 @@ def main() -> None:
         action="store_true",
         help="Run no-rerank, rerank-full, rerank-compact, rerank-smart comparison",
     )
+    parser.add_argument(
+        "--compare-methods",
+        action="store_true",
+        help="Compare dense, keyword, hybrid, hybrid+rerank (Recall@K, MRR, avg/median rank, miss count)",
+    )
+    parser.add_argument(
+        "--compare-methods-output",
+        type=str,
+        default="eval/results/comparison_methods.md",
+        help="Save method comparison table to this path (markdown or .csv)",
+    )
+    parser.add_argument(
+        "--compare-pool",
+        action="store_true",
+        help="Compare pool (make+model) vs global-only index; print Recall@1, Recall@10, MRR table",
+    )
     args = parser.parse_args()
 
     if not os.path.exists(args.eval_file):
@@ -467,7 +760,11 @@ def main() -> None:
         logging.getLogger("carrecall_rag").setLevel(logging.WARNING)
 
     # Alpha sweep: list of alphas to try (only for hybrid)
-    if args.alpha_list:
+    if args.alpha_sweep and not args.alpha_list:
+        alpha_values = [0.5, 0.6, 0.7, 0.8, 0.9]
+        if args.mode != "hybrid":
+            logger.warning("--alpha-sweep implies hybrid; mode was %s", args.mode)
+    elif args.alpha_list:
         alpha_values = [float(x.strip()) for x in args.alpha_list.split(",")]
         if args.mode != "hybrid":
             logger.warning("--alpha-list ignored when mode != hybrid")
@@ -500,6 +797,13 @@ def main() -> None:
 
     # Load or build indexes
     indexes = load_faiss_indexes(args.cache_dir)
+    # Encoder model: --dense-model overrides --encoder-model overrides --model-dir
+    encoder_model = (args.dense_model or args.encoder_model or args.model_dir).strip() or args.model_dir
+    if args.dense_model:
+        logger.info("Using dense model: %s", encoder_model)
+    elif args.encoder_model:
+        logger.info("Using encoder model: %s", encoder_model)
+
     if not indexes.get("global"):
         logger.info("Indexes not found. Building from corpus...")
         if not os.path.exists(args.corpus_path):
@@ -507,7 +811,7 @@ def main() -> None:
             sys.exit(1)
         corpus_docs = load_corpus(args.corpus_path)
         build_faiss_indexes(
-            args.model_dir,
+            encoder_model,
             corpus_docs,
             use_pool_indexes=not args.no_pool,
             min_pool_docs=50,
@@ -521,15 +825,15 @@ def main() -> None:
 
     # Load encoder (not needed for keyword-only unless compare table is requested)
     encoder: SentenceTransformer | None = None
-    if args.mode != "keyword" or args.compare_table:
-        if not os.path.exists(args.model_dir):
-            logger.error("Model not found: %s. Run train_biencoder first.", args.model_dir)
+    if args.mode != "keyword" or args.compare_table or args.compare_methods or args.compare_pool:
+        if encoder_model.startswith(("data", ".", "/")) and not os.path.exists(encoder_model):
+            logger.error("Model path not found: %s. Run train_biencoder or set --encoder-model to a HF name.", encoder_model)
             sys.exit(1)
-        encoder = SentenceTransformer(args.model_dir)
+        encoder = SentenceTransformer(encoder_model)
 
     # Load neural reranker when enabled (or for compare table's hybrid+rerank row).
     reranker: NeuralReranker | None = None
-    if args.rerank or args.compare_table:
+    if args.rerank or args.compare_table or args.compare_methods or args.compare_pool:
         reranker = NeuralReranker(
             model_name=args.rerank_model,
             batch_size=args.rerank_batch_size,
@@ -553,7 +857,33 @@ def main() -> None:
         )
         return
 
+    # --compare-methods: dense vs keyword vs hybrid vs hybrid+rerank, print + save table
+    if args.compare_methods:
+        _run_compare_methods(
+            queries=queries,
+            indexes=indexes,
+            encoder=encoder,
+            reranker=reranker,
+            args=args,
+            k_values=k_values,
+            output_path=args.compare_methods_output,
+        )
+        return
+
+    # --compare-pool: pool vs global index
+    if args.compare_pool:
+        _run_compare_pool(
+            queries=queries,
+            indexes=indexes,
+            encoder=encoder,
+            reranker=reranker,
+            args=args,
+            k_values=k_values,
+        )
+        return
+
     # Run for each alpha (sweep) or single alpha
+    alpha_sweep_results: list[tuple[float, float, float, float]] = []  # (alpha, R@1, R@10, MRR)
     for alpha in alpha_values:
         hit_at: dict[int, int] = defaultdict(int)
         miss_count = 0
@@ -572,6 +902,7 @@ def main() -> None:
                 logger.warning("Skipping row %d: missing query or gold_campaign", i + 1)
                 continue
 
+            effective_pool = "global" if args.no_pool else getattr(args, "pool_strategy", "boosted")
             out = run_retrieval(
                 query,
                 make,
@@ -583,13 +914,15 @@ def main() -> None:
                 dense_topk=args.dense_topk,
                 keyword_topk=args.keyword_topk,
                 alpha=alpha,
-                use_pool_indexes=not args.no_pool,
                 min_pool_docs=50,
+                pool_strategy=effective_pool,
                 rerank_topn=args.rerank_topn,
                 use_rerank=args.rerank,
                 reranker=reranker,
                 rerank_limit=args.rerank_limit,
                 rerank_text_format=args.rerank_text_format,
+                normalize_query=not args.no_query_normalization,
+                expand_query=(not args.no_query_normalization and not args.no_query_expansion),
                 return_score_details=True,
             )
             all_campaigns, campaign_results, pre_campaigns, pre_candidates, ranked_docs = out
@@ -868,6 +1201,14 @@ def main() -> None:
             mid = len(sorted_ranks) // 2
             median_rank = sorted_ranks[mid] if len(sorted_ranks) % 2 else (sorted_ranks[mid - 1] + sorted_ranks[mid]) / 2.0
 
+        if args.alpha_sweep and evaluated_n > 0:
+            alpha_sweep_results.append((
+                alpha,
+                hit_at[1] / evaluated_n,
+                hit_at[10] / evaluated_n,
+                mrr,
+            ))
+
         # Summary section
         print()
         print("=" * 60)
@@ -916,6 +1257,18 @@ def main() -> None:
             for r in debug_rows:
                 f.write(json.dumps(r, ensure_ascii=False) + "\n")
         logger.info("Wrote per-query debug to %s", out_path)
+
+    # Alpha sweep table (alpha | Recall@1 | Recall@10 | MRR)
+    if args.alpha_sweep and alpha_sweep_results:
+        print()
+        print("=" * 50)
+        print("Alpha tuning (alpha | Recall@1 | Recall@10 | MRR)")
+        print("=" * 50)
+        print(f"{'alpha':<8} {'Recall@1':>10} {'Recall@10':>10} {'MRR':>10}")
+        print("-" * 50)
+        for a, r1, r10, mrr in alpha_sweep_results:
+            print(f"{a:<8.1f} {r1:>10.2f} {r10:>10.2f} {mrr:>10.4f}")
+        print("=" * 50)
 
 
 if __name__ == "__main__":

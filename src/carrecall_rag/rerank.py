@@ -372,7 +372,7 @@ def build_hybrid_candidates(
     dense_results: list[tuple[dict, float]],
     keyword_results: list[tuple[dict, float]],
     *,
-    alpha: float = 0.50,
+    alpha: float = 0.80,
     top_n: int = 50,
 ) -> list[dict]:
     """Merge dense + keyword; minmax norm then (1-alpha)*dense + alpha*keyword. Sorted by hybrid_score desc."""
