@@ -140,11 +140,106 @@ def _best_defect_text(doc: dict, text: str, query: str) -> tuple[str, str]:
     return "", ""
 
 
+def _chunk_selection_text(doc: dict) -> str:
+    """Text used for chunk-level query relevance scoring."""
+    parts = [
+        doc.get("title", ""),
+        doc.get("summary", ""),
+        doc.get("subject", ""),
+        doc.get("component", ""),
+        doc.get("consequence", ""),
+        doc.get("text", ""),
+    ]
+    return " ".join((p or "").strip() for p in parts if p).strip()
+
+
+def _phrase_hits(query: str, text: str) -> list[str]:
+    """Important phrase matches to bias chunk selection."""
+    q = (query or "").lower()
+    t = (text or "").lower()
+    phrases = [
+        "clock spring",
+        "warning light",
+        "air bag",
+        "airbag",
+        "orc",
+        "cruise control",
+        "disable air bags",
+    ]
+    hits = []
+    for p in phrases:
+        if p in q and p in t:
+            hits.append(p)
+    return hits
+
+
+def _select_campaign_evidence_chunks(
+    rows: list[dict],
+    query: str,
+    *,
+    max_chunks: int = 3,
+) -> dict[str, dict]:
+    """
+    Score all chunks within each campaign and select top query-relevant evidence.
+    """
+    by_campaign: dict[str, list[dict]] = {}
+    q_terms = set(_tokenize(query))
+    for row in rows:
+        campaign = row.get("campaign_number", "") or ""
+        if not campaign:
+            continue
+        by_campaign.setdefault(campaign, []).append(row)
+
+    selected: dict[str, dict] = {}
+    for campaign, campaign_rows in by_campaign.items():
+        scored = []
+        for row in campaign_rows:
+            doc = row.get("doc") or {}
+            text_for_score = _chunk_selection_text(doc)
+            toks = set(_tokenize(text_for_score))
+            overlap_terms = sorted(toks & q_terms)
+            issue_terms = sorted(toks & IMPORTANT_ISSUE_TERMS)
+            phrase_terms = _phrase_hits(query, text_for_score)
+            base = float(row.get("hybrid_score", 0.0))
+            score = (3.0 * len(overlap_terms)) + (2.0 * len(issue_terms)) + (4.0 * len(phrase_terms)) + (0.25 * base)
+            scored.append({
+                "row": row,
+                "score": score,
+                "overlap_terms": overlap_terms,
+                "issue_terms": issue_terms,
+                "phrase_hits": phrase_terms,
+                "hybrid_score": base,
+            })
+
+        scored.sort(key=lambda x: (x["score"], x["hybrid_score"]), reverse=True)
+        chosen = scored[: max(1, max_chunks)]
+        if chosen and chosen[0]["score"] <= 0:
+            chosen = scored[:1]
+
+        selected[campaign] = {
+            "chosen_rows": [x["row"] for x in chosen],
+            "chosen_chunk_ids": [((x["row"].get("doc") or {}).get("doc_id", "")) for x in chosen],
+            "selection_debug": [
+                {
+                    "doc_id": (x["row"].get("doc") or {}).get("doc_id", ""),
+                    "score": x["score"],
+                    "hybrid_score": x["hybrid_score"],
+                    "overlap_terms": x["overlap_terms"],
+                    "important_terms": x["issue_terms"],
+                    "phrase_hits": x["phrase_hits"],
+                }
+                for x in chosen
+            ],
+        }
+    return selected
+
+
 def _build_rerank_text(
     doc: dict,
     *,
     query: str = "",
     text_format: str = "full",
+    campaign_context: dict | None = None,
 ) -> tuple[str, dict]:
     """
     Build reranker input text and expose exact source fields used.
@@ -154,7 +249,12 @@ def _build_rerank_text(
       - compact: title + component + consequence
       - smart: campaign + informative fields + top relevant sentences
     """
-    text = (doc.get("text") or "").strip()
+    context_rows = (campaign_context or {}).get("chosen_rows") or []
+    if text_format == "smart" and context_rows:
+        context_text = "\n".join(_chunk_selection_text((r.get("doc") or {})) for r in context_rows)
+        text = context_text.strip()
+    else:
+        text = (doc.get("text") or "").strip()
     component = (doc.get("component") or "").strip()
     consequence = (doc.get("consequence") or "").strip()
     campaign_number = (doc.get("campaign_number") or "").strip()
@@ -193,6 +293,8 @@ def _build_rerank_text(
         "relevant_sentences": top_sents,
         "excluded_boilerplate_count": removed_boilerplate,
         "selected_fields": [],
+        "selected_chunk_ids": (campaign_context or {}).get("chosen_chunk_ids", []),
+        "selection_debug": (campaign_context or {}).get("selection_debug", []),
     }
 
     if text_format == "compact":
@@ -212,6 +314,35 @@ def _build_rerank_text(
         return text, fields
 
     if text_format == "smart":
+        if context_rows:
+            # Use campaign-level evidence-selected chunks instead of arbitrary chunk text.
+            context_doc0 = (context_rows[0].get("doc") or {})
+            if not component:
+                component = (context_doc0.get("component") or "").strip()
+            if not title:
+                context_title = (
+                    context_doc0.get("title")
+                    or context_doc0.get("summary")
+                    or context_doc0.get("subject")
+                    or ""
+                )
+                context_title = " ".join(str(context_title).split()).strip()
+                if _is_informative_title(context_title):
+                    title = context_title
+                    title_source = "campaign_selected_chunk"
+            if not consequence:
+                consequence = _extract_consequence(text)
+                consequence_source = "campaign_selected_chunk_extract" if consequence else consequence_source
+            defect_text, defect_source = _best_defect_text(context_doc0, text, query)
+
+        fields["title"] = title
+        fields["title_source"] = title_source
+        fields["component"] = component
+        fields["defect_summary"] = defect_text
+        fields["defect_source"] = defect_source
+        fields["consequence"] = consequence
+        fields["consequence_source"] = consequence_source
+
         lines: list[str] = []
         if campaign_number:
             lines.append(f"Campaign: {campaign_number}")
@@ -386,10 +517,21 @@ def rerank_candidates(
     if not candidates:
         return []
 
+    campaign_contexts: dict[str, dict] = {}
+    if text_format == "smart":
+        campaign_contexts = _select_campaign_evidence_chunks(candidates, query, max_chunks=3)
+
     ranked = [dict(c) for c in candidates]
     for i, c in enumerate(ranked):
         c["stage1_rank"] = i + 1
-        text, fields = _build_rerank_text(c.get("doc") or {}, query=query, text_format=text_format)
+        campaign = c.get("campaign_number", "") or ((c.get("doc") or {}).get("campaign_number", "") or "")
+        campaign_ctx = campaign_contexts.get(campaign)
+        text, fields = _build_rerank_text(
+            c.get("doc") or {},
+            query=query,
+            text_format=text_format,
+            campaign_context=campaign_ctx,
+        )
         c["rerank_input_char_len"] = len(text)
         c["rerank_text_fields"] = fields
         c["rerank_input_text"] = text
