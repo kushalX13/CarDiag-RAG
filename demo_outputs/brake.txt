@@ -1,0 +1,20 @@
+
+Possible Recall-Related Issue
+
+Query:
+brake master cylinder leak into brake booster
+
+Best Match:
+20V332000 — Brake Master Cylinder May Leak into Booster
+
+Why It Matches:
+The brake master cylinder may fail, resulting in a change in brake pedal travel and feel, increased pedal effort and reduced front brake. This closely matches your query because it directly addresses brake fluid leak into the brake booster.
+
+Other Relevant Recall Candidates:
+  - 16V345000 — SERVICE BRAKES, HYDRAULIC:FLUID
+
+Safety Risk:
+Potential risks include reduced braking ability and increased stopping distance, which may increase crash risk.
+
+Suggested Next Step:
+Contact your dealer to verify if your vehicle is affected, or look up your VIN at NHTSA.gov/recalls.

@@ -1,0 +1,21 @@
+
+Possible Recall-Related Issue
+
+Query:
+transmission may not be in PARK despite selecting park vehicle rollaway shift control cable
+
+Best Match:
+14V414000 — Transmission Shift Cable/Rollaway/FMVSS 102
+
+Why It Matches:
+The Transmission Shift Cable/Rollaway/FMVSS 102 may be defective. This closely matches your query because the recalled issue aligns with your description.
+
+Other Relevant Recall Candidates:
+  - 97V213000 — TOYOTA/KEY INTERLOCK
+  - 00V211000 — less directly related secondary candidate; TOYOTA/PARKING LOCK ROD
+
+Safety Risk:
+Potential risks include injury, which may increase crash risk.
+
+Suggested Next Step:
+Contact your dealer to verify if your vehicle is affected, or look up your VIN at NHTSA.gov/recalls.
