@@ -252,12 +252,13 @@ def _run_compare_table(
     args: argparse.Namespace,
     k_values: list[int],
 ) -> None:
-    """Compare baseline vs rerank depths on hybrid retrieval."""
+    """Compare baseline and rerank text construction variants."""
+    rerank_limit_for_compare = args.rerank_limit if args.rerank_limit > 0 else args.rerank_topn
     configs = [
-        ("no-rerank", False, 0),
-        ("rerank-top10", True, 10),
-        ("rerank-top20", True, 20),
-        ("rerank-top50", True, 50),
+        ("no-rerank", False, "full"),
+        ("rerank-full", True, "full"),
+        ("rerank-compact", True, "compact"),
+        ("rerank-smart", True, "smart"),
     ]
     results: dict[str, dict[int, int]] = {}
     valid_queries = [r for r in queries if r.get("query", "").strip() and _parse_gold(r)]
@@ -266,7 +267,7 @@ def _run_compare_table(
         logger.error("No valid queries for comparison")
         return
 
-    for label, use_rerank, rerank_limit in configs:
+    for label, use_rerank, text_format in configs:
         hit_at: dict[int, int] = defaultdict(int)
         for row in valid_queries:
             query = row.get("query", "").strip()
@@ -280,11 +281,11 @@ def _run_compare_table(
                 query, make, model, year, indexes, encoder,
                 mode="hybrid", dense_topk=args.dense_topk, keyword_topk=args.keyword_topk,
                 alpha=args.alpha, use_pool_indexes=not args.no_pool, min_pool_docs=50,
-                rerank_topn=max(args.rerank_topn, rerank_limit),
+                rerank_topn=max(args.rerank_topn, rerank_limit_for_compare),
                 use_rerank=use_rerank,
                 reranker=reranker,
-                rerank_limit=rerank_limit,
-                rerank_text_format=args.rerank_text_format,
+                rerank_limit=rerank_limit_for_compare if use_rerank else 0,
+                rerank_text_format=text_format,
             )
             top10 = out[:10]
             for k in k_values:
@@ -294,7 +295,7 @@ def _run_compare_table(
 
     print()
     print("=" * 70)
-    print("Comparison: Hybrid baseline vs rerank depths")
+    print("Comparison: no-rerank vs full/compact/smart rerank")
     print("=" * 70)
     header = f"{'Config':<14} {'R@1':>6} {'R@3':>6} {'R@5':>6} {'R@10':>6}"
     print(header)
@@ -376,9 +377,9 @@ def main() -> None:
     parser.add_argument(
         "--rerank-text-format",
         type=str,
-        choices=["full", "compact"],
+        choices=["full", "compact", "smart"],
         default="full",
-        help="Text construction for reranker: full doc text or compact title+component+consequence",
+        help="Text construction for reranker: full, compact, or smart",
     )
     parser.add_argument(
         "--rerank-limit",
@@ -451,7 +452,7 @@ def main() -> None:
     parser.add_argument(
         "--compare-table",
         action="store_true",
-        help="Run no-rerank vs rerank-top10/20/50 comparison table",
+        help="Run no-rerank, rerank-full, rerank-compact, rerank-smart comparison",
     )
     args = parser.parse_args()
 

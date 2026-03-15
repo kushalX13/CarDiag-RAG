@@ -9,6 +9,23 @@ from sentence_transformers import CrossEncoder
 
 logger = logging.getLogger(__name__)
 
+IMPORTANT_ISSUE_TERMS = {
+    "airbag", "airbags", "orc", "clock", "spring", "warning", "light",
+    "disable", "deployment", "restraint", "steering", "module", "stall",
+    "brake", "fire", "crash", "injury", "loss", "power",
+}
+
+BOILERPLATE_PATTERNS = [
+    r"\bis recalling\b",
+    r"\bowners may contact\b",
+    r"\bnhtsa campaign\b",
+    r"\bthis remedy is\b",
+    r"\bdealers will\b",
+    r"\bvehicles included in this recall\b",
+    r"\bif your vehicle\b",
+    r"\bfor additional information\b",
+]
+
 
 def _first_sentence(text: str, max_chars: int = 180) -> str:
     """Best-effort first sentence extraction."""
@@ -38,9 +55,95 @@ def _extract_consequence(text: str, max_chars: int = 220) -> str:
     return ""
 
 
+def _tokenize(text: str) -> list[str]:
+    """Tokenize text to lowercase alphanumeric terms."""
+    return re.findall(r"[a-z0-9]+", (text or "").lower())
+
+
+def _is_boilerplate_sentence(sentence: str) -> bool:
+    """Heuristic boilerplate detector for low-signal recall prose."""
+    s = (sentence or "").strip().lower()
+    if not s:
+        return True
+    if len(s) < 18:
+        return True
+    if re.search(r"\b(vin|my \d{4}-\d{4}|[a-z]{2,}-\d{2,})\b", s):
+        return True
+    for pat in BOILERPLATE_PATTERNS:
+        if re.search(pat, s):
+            return True
+    return False
+
+
+def _is_informative_title(title: str) -> bool:
+    """Reject generic/non-informative titles."""
+    t = " ".join((title or "").split()).strip()
+    if len(t) < 12:
+        return False
+    tl = t.lower()
+    generic = [
+        "safety recall", "recall notice", "important safety information",
+        "manufacturer recall", "customer advisory", "campaign",
+    ]
+    if any(g in tl for g in generic):
+        return False
+    if _is_boilerplate_sentence(t):
+        return False
+    return True
+
+
+def _split_sentences(text: str) -> list[str]:
+    """Split by sentence punctuation/newlines."""
+    if not text:
+        return []
+    raw = re.split(r"(?<=[.!?])\s+|\n+", text)
+    return [s.strip() for s in raw if s and s.strip()]
+
+
+def _sentence_relevance_score(sentence: str, query_terms: set[str]) -> float:
+    """Score sentence by query overlap + issue vocab overlap."""
+    toks = set(_tokenize(sentence))
+    if not toks:
+        return 0.0
+    overlap = len(toks & query_terms)
+    issue_overlap = len(toks & IMPORTANT_ISSUE_TERMS)
+    starts_with_issue = 1.0 if any(sentence.lower().startswith(x) for x in ("the ", "a ", "an ")) else 0.0
+    return (2.0 * overlap) + (1.5 * issue_overlap) + starts_with_issue
+
+
+def _top_relevant_sentences(text: str, query: str, top_k: int = 3) -> tuple[list[str], int]:
+    """Return top relevant non-boilerplate sentences and count of removed boilerplate."""
+    q_terms = set(_tokenize(query)) | IMPORTANT_ISSUE_TERMS
+    sents = _split_sentences(text)
+    filtered = []
+    removed = 0
+    for s in sents:
+        if _is_boilerplate_sentence(s):
+            removed += 1
+            continue
+        score = _sentence_relevance_score(s, q_terms)
+        if score > 0:
+            filtered.append((s, score))
+    filtered.sort(key=lambda x: x[1], reverse=True)
+    return [s for s, _ in filtered[:top_k]], removed
+
+
+def _best_defect_text(doc: dict, text: str, query: str) -> tuple[str, str]:
+    """Pick defect/summary from explicit fields or relevant sentence."""
+    for key in ("defect", "summary", "description"):
+        val = (doc.get(key) or "").strip()
+        if val and not _is_boilerplate_sentence(val):
+            return val[:220], key
+    top_sents, _ = _top_relevant_sentences(text, query, top_k=1)
+    if top_sents:
+        return top_sents[0][:220], "relevant_sentence"
+    return "", ""
+
+
 def _build_rerank_text(
     doc: dict,
     *,
+    query: str = "",
     text_format: str = "full",
 ) -> tuple[str, dict]:
     """
@@ -49,35 +152,97 @@ def _build_rerank_text(
     text_format:
       - full: doc.text
       - compact: title + component + consequence
+      - smart: campaign + informative fields + top relevant sentences
     """
     text = (doc.get("text") or "").strip()
     component = (doc.get("component") or "").strip()
     consequence = (doc.get("consequence") or "").strip()
-    title = (doc.get("title") or doc.get("summary") or doc.get("subject") or "").strip()
+    campaign_number = (doc.get("campaign_number") or "").strip()
+    title_raw = (doc.get("title") or doc.get("summary") or doc.get("subject") or "").strip()
+    title = " ".join(title_raw.split()).strip()
+    title_source = "field" if title else ""
     if not title:
         title = _first_sentence(text)
+        title_source = "text_first_sentence" if title else ""
+    if not _is_informative_title(title):
+        title = ""
+        title_source = ""
+
     if not consequence:
         consequence = _extract_consequence(text)
+        consequence_source = "text_extract" if consequence else ""
+    else:
+        consequence_source = "field"
+
+    defect_text, defect_source = _best_defect_text(doc, text, query)
+    query_overlap_terms = sorted(set(_tokenize(query)) & set(_tokenize(text)))
+    top_sents, removed_boilerplate = _top_relevant_sentences(text, query, top_k=3)
 
     fields = {
         "text_format": text_format,
+        "campaign_number": campaign_number,
         "title": title,
+        "title_source": title_source,
         "component": component,
+        "defect_summary": defect_text,
+        "defect_source": defect_source,
         "consequence": consequence,
+        "consequence_source": consequence_source,
         "text_len": len(text),
+        "query_overlap_terms": query_overlap_terms,
+        "relevant_sentences": top_sents,
+        "excluded_boilerplate_count": removed_boilerplate,
+        "selected_fields": [],
     }
 
     if text_format == "compact":
         parts = []
         if title:
             parts.append(f"Title: {title}")
+            fields["selected_fields"].append("title")
         if component:
             parts.append(f"Component: {component}")
+            fields["selected_fields"].append("component")
         if consequence:
             parts.append(f"Consequence: {consequence}")
+            fields["selected_fields"].append("consequence")
         compact = " | ".join(parts).strip()
         if compact:
             return compact, fields
+        return text, fields
+
+    if text_format == "smart":
+        lines: list[str] = []
+        if campaign_number:
+            lines.append(f"Campaign: {campaign_number}")
+            fields["selected_fields"].append("campaign_number")
+        if title:
+            lines.append(f"Title: {title}")
+            fields["selected_fields"].append("title")
+        if component:
+            lines.append(f"Component: {component}")
+            fields["selected_fields"].append("component")
+        if defect_text:
+            lines.append(f"Defect: {defect_text}")
+            fields["selected_fields"].append("defect_summary")
+        if consequence:
+            lines.append(f"Risk: {consequence}")
+            fields["selected_fields"].append("consequence")
+        for sent in top_sents:
+            if len(lines) >= 5:
+                break
+            if sent not in " ".join(lines):
+                lines.append(f"Evidence: {sent}")
+                fields["selected_fields"].append("relevant_sentence")
+        if len(lines) < 2 and text:
+            lines.append(_first_sentence(text, max_chars=260))
+            fields["selected_fields"].append("fallback_text")
+
+        smart = "\n".join(lines[:5]).strip()
+        if len(smart) > 900:
+            smart = smart[:900].rsplit(" ", 1)[0]
+        if smart:
+            return smart, fields
         return text, fields
 
     return text, fields
@@ -224,9 +389,10 @@ def rerank_candidates(
     ranked = [dict(c) for c in candidates]
     for i, c in enumerate(ranked):
         c["stage1_rank"] = i + 1
-        text, fields = _build_rerank_text(c.get("doc") or {}, text_format=text_format)
+        text, fields = _build_rerank_text(c.get("doc") or {}, query=query, text_format=text_format)
         c["rerank_input_char_len"] = len(text)
         c["rerank_text_fields"] = fields
+        c["rerank_input_text"] = text
 
     if use_rerank and reranker is not None:
         limit = len(ranked)
@@ -234,23 +400,18 @@ def rerank_candidates(
             limit = min(limit, rerank_limit)
 
         to_rerank = ranked[:limit]
-        texts = [((c.get("doc") or {}).get("text", "") or "") for c in to_rerank]
-        if text_format:
-            texts = [_build_rerank_text((c.get("doc") or {}), text_format=text_format)[0] for c in to_rerank]
+        texts = [c.get("rerank_input_text", "") for c in to_rerank]
         rerank_scores = reranker.score(query, texts)
         for i, score in enumerate(rerank_scores):
             to_rerank[i]["rerank_score"] = score
-            to_rerank[i]["rerank_input_text"] = texts[i]
 
         for c in ranked[limit:]:
             c["rerank_score"] = c.get("hybrid_score", 0.0)
-            c["rerank_input_text"] = ""
 
         ranked = sorted(to_rerank, key=lambda x: x.get("rerank_score", float("-inf")), reverse=True) + ranked[limit:]
     else:
         for c in ranked:
             c["rerank_score"] = c.get("hybrid_score", 0.0)
-            c["rerank_input_text"] = ""
 
     for i, c in enumerate(ranked):
         c["post_rerank_rank"] = i + 1
