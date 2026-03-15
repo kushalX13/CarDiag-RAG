@@ -13,7 +13,7 @@ from .demo_retrieve import (
     _build_query_from_context,
 )
 from .rag_answer import generate_rag_answer
-from .rerank import rerank
+from .rerank import NeuralReranker, build_hybrid_candidates, rerank_candidates
 from .retrieve import (
     build_faiss_indexes,
     keyword_search,
@@ -66,7 +66,7 @@ def main() -> None:
         "--alpha",
         type=float,
         default=0.50,
-        help="Hybrid weight: combined = (1-alpha)*dense + alpha*kw (default 0.50)",
+        help="Stage-1 hybrid fusion weight: (1-alpha)*dense + alpha*keyword (default 0.50)",
     )
     parser.add_argument(
         "--model-dir",
@@ -91,17 +91,24 @@ def main() -> None:
         action="store_true",
         help="Force global index (disable pool/make indexes)",
     )
+    parser.add_argument("--rerank", action="store_true", help="Enable stage-2 neural reranking")
     parser.add_argument(
-        "--rerank-tokens",
+        "--rerank-topn",
         type=int,
-        default=12,
-        help="Max query tokens for rerank",
+        default=50,
+        help="Number of stage-1 hybrid candidates passed to reranker",
     )
     parser.add_argument(
-        "--rerank-phrases",
+        "--rerank-model",
+        type=str,
+        default="cross-encoder/ms-marco-MiniLM-L-6-v2",
+        help="Cross-encoder model name/path for neural reranking",
+    )
+    parser.add_argument(
+        "--rerank-batch-size",
         type=int,
-        default=10,
-        help="Max phrases for rerank",
+        default=32,
+        help="Batch size for neural reranking",
     )
     parser.add_argument(
         "--debug",
@@ -164,42 +171,46 @@ def main() -> None:
         sys.exit(1)
     model = SentenceTransformer(args.model_dir)
 
-    # Hybrid retrieval: dense + keyword
-    results = search(
+    # Stage 1: Hybrid retrieval candidate generation (dense + keyword -> fused top N).
+    dense_topk = max(args.dense_topk, args.rerank_topn)
+    keyword_topk = max(args.keyword_topk, args.rerank_topn)
+    dense_results = search(
         search_query,
         make_norm,
         mkey,
         indexes,
         model,
-        top_k=args.dense_topk,
+        top_k=dense_topk,
         use_pool_indexes=not args.no_pool,
         min_pool_docs=50,
     )
 
-    kw_results = keyword_search(
+    keyword_results = keyword_search(
         query_text,
         make_norm,
         mkey,
         indexes,
-        top_k=args.keyword_topk,
+        top_k=keyword_topk,
         use_pool_indexes=not args.no_pool,
         min_pool_docs=50,
     )
 
-    seen: dict[str, tuple[dict, float]] = {}
-    for doc, dense_score in results:
-        did = doc.get("doc_id", "")
-        if did and did not in seen:
-            seen[did] = (doc, dense_score)
-    for doc, _ in kw_results:
-        did = doc.get("doc_id", "")
-        if did and did not in seen:
-            seen[did] = (doc, 0.0)
-    results = list(seen.values())
+    candidates = build_hybrid_candidates(
+        dense_results,
+        keyword_results,
+        alpha=args.alpha,
+        top_n=args.rerank_topn,
+    )
+    logger.info(
+        "Stage1 hybrid: dense=%d keyword=%d -> candidates=%d (top_n=%d, alpha=%.2f)",
+        len(dense_results),
+        len(keyword_results),
+        len(candidates),
+        args.rerank_topn,
+        args.alpha,
+    )
 
-    logger.info("Hybrid retrieval: %d candidates", len(results))
-
-    if not results:
+    if not candidates:
         logger.info("No results found.")
         answer = generate_rag_answer(query_text, [], top_k=args.topk)
         final_output = "\n" + answer
@@ -213,18 +224,23 @@ def main() -> None:
                 f.write(final_output.rstrip() + "\n")
         sys.exit(0)
 
-    # Rerank with alpha=0.5 (hybrid)
-    results_for_agg = rerank(
-        results,
+    # Stage 2: Optional neural reranking on stage-1 candidates.
+    reranker = None
+    if args.rerank:
+        reranker = NeuralReranker(
+            model_name=args.rerank_model,
+            batch_size=args.rerank_batch_size,
+        )
+    ranked_docs = rerank_candidates(
         query_text,
-        alpha=args.alpha,
-        max_tokens=args.rerank_tokens,
-        max_phrases=args.rerank_phrases,
-        normalize_dense=True,
+        candidates,
+        use_rerank=args.rerank,
+        reranker=reranker,
+        top_k=args.topk,
     )
 
     campaigns = _aggregate_by_campaign_with_scores(
-        results_for_agg,
+        ranked_docs,
         make_norm=make_norm if make_norm else None,
         debug=args.debug,
     )

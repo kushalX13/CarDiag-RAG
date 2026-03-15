@@ -14,7 +14,7 @@ from .demo_retrieve import (
     _aggregate_by_campaign_with_scores,
     _build_query_from_context,
 )
-from .rerank import rerank
+from .rerank import NeuralReranker, build_hybrid_candidates, rerank_candidates
 from .retrieve import (
     build_faiss_indexes,
     keyword_search,
@@ -48,10 +48,11 @@ def run_retrieval(
     alpha: float = 0.50,
     use_pool_indexes: bool = True,
     min_pool_docs: int = 50,
-    rerank_tokens: int = 12,
-    rerank_phrases: int = 10,
+    rerank_topn: int = 50,
+    use_rerank: bool = False,
+    reranker: NeuralReranker | None = None,
     return_score_details: bool = False,
-) -> list[str] | tuple[list[str], list[dict]]:
+) -> list[str] | tuple[list[str], list[dict], list[str]]:
     """
     Run retrieval pipeline: search (dense/keyword/hybrid) -> rerank -> aggregate.
     Returns list of campaign_numbers in rank order (top first).
@@ -62,11 +63,11 @@ def run_retrieval(
 
     search_query = _build_query_from_context(make, model, year, query_text)
 
-    # Dense search (skip for keyword-only)
+    # Stage 1 retrieval sources
     if mode == "keyword":
-        results = []
+        dense_results = []
     else:
-        results = search(
+        dense_results = search(
             search_query,
             make_norm,
             mkey,
@@ -77,9 +78,9 @@ def run_retrieval(
             min_pool_docs=min_pool_docs,
         )
 
-    # Keyword search (for hybrid or keyword-only)
+    keyword_results: list[tuple[dict, float]] = []
     if mode in ("hybrid", "keyword"):
-        kw_results = keyword_search(
+        keyword_results = keyword_search(
             query_text,
             make_norm,
             mkey,
@@ -88,43 +89,43 @@ def run_retrieval(
             use_pool_indexes=use_pool_indexes,
             min_pool_docs=min_pool_docs,
         )
-        if mode == "keyword":
-            results = kw_results
-        else:
-            seen: dict[str, tuple[dict, float]] = {}
-            for doc, dense_score in results:
-                did = doc.get("doc_id", "")
-                if did and did not in seen:
-                    seen[did] = (doc, dense_score)
-            for doc, _ in kw_results:
-                did = doc.get("doc_id", "")
-                if did and did not in seen:
-                    seen[did] = (doc, 0.0)
-            results = list(seen.values())
 
-    if not results:
+    stage1_alpha = alpha if mode == "hybrid" else (0.0 if mode == "dense" else 1.0)
+    stage1_topn = rerank_topn if mode == "hybrid" else (dense_topk if mode == "dense" else keyword_topk)
+    candidates = build_hybrid_candidates(
+        dense_results,
+        keyword_results,
+        alpha=stage1_alpha,
+        top_n=stage1_topn,
+    )
+    if not candidates:
+        if return_score_details:
+            return [], [], []
         return []
 
-    # Rerank: alpha=0 for pure dense, alpha=1 for pure keyword, hybrid uses given alpha
-    rerank_alpha = 0.0 if mode == "dense" else (1.0 if mode == "keyword" else alpha)
-    results_for_agg = rerank(
-        results,
+    # Save stage-1 ranking (before optional stage-2 rerank)
+    pre_campaign_results = _aggregate_by_campaign_with_scores(
+        candidates,
+        make_norm=make_norm if make_norm else None,
+    )
+    pre_campaigns = [c["campaign_number"] for c in pre_campaign_results]
+
+    ranked_docs = rerank_candidates(
         query_text,
-        alpha=rerank_alpha,
-        max_tokens=rerank_tokens,
-        max_phrases=rerank_phrases,
-        normalize_dense=(mode == "hybrid"),
+        candidates,
+        use_rerank=use_rerank,
+        reranker=reranker,
     )
 
-    # Aggregate by campaign
+    # Aggregate by campaign after stage-2 rerank (or same order when disabled)
     campaign_results = _aggregate_by_campaign_with_scores(
-        results_for_agg,
+        ranked_docs,
         make_norm=make_norm if make_norm else None,
     )
     campaigns = [c["campaign_number"] for c in campaign_results]
 
     if return_score_details:
-        return campaigns, campaign_results
+        return campaigns, campaign_results, pre_campaigns
     return campaigns
 
 
@@ -162,12 +163,13 @@ def _gold_status(rank: int | None, top_k: int = 10) -> str:
 
 
 def _scores_for_campaign(campaign_result: dict) -> dict:
-    """Extract dense, keyword, fused from campaign's best doc."""
+    """Extract dense, keyword, hybrid, rerank from campaign's best doc."""
     ev = (campaign_result.get("evidence_snippets") or [{}])[0]
     return {
         "dense": ev.get("dense_score", 0.0),
         "keyword": ev.get("keyword_score", 0.0),
-        "fused": ev.get("combined", campaign_result.get("campaign_score", 0.0)),
+        "hybrid": ev.get("hybrid_score", 0.0),
+        "rerank": ev.get("rerank_score", campaign_result.get("campaign_score", 0.0)),
     }
 
 
@@ -175,16 +177,16 @@ def _run_compare_table(
     queries: list[dict],
     indexes: dict,
     encoder: SentenceTransformer | None,
+    reranker: NeuralReranker | None,
     args: argparse.Namespace,
     k_values: list[int],
 ) -> None:
-    """Run dense, keyword, hybrid@0.3/0.5/0.7 and print compact comparison table."""
+    """Run core retrieval variants and print compact comparison table."""
     configs = [
-        ("dense", "dense", 0.0),
-        ("keyword", "keyword", 0.0),
-        ("hybrid@0.3", "hybrid", 0.3),
-        ("hybrid@0.5", "hybrid", 0.5),
-        ("hybrid@0.7", "hybrid", 0.7),
+        ("dense", "dense", 0.0, False),
+        ("keyword", "keyword", 0.0, False),
+        ("hybrid-only", "hybrid", 0.5, False),
+        ("hybrid+rerank", "hybrid", 0.5, True),
     ]
     results: dict[str, dict[int, int]] = {}
     valid_queries = [r for r in queries if r.get("query", "").strip() and _parse_gold(r)]
@@ -193,7 +195,7 @@ def _run_compare_table(
         logger.error("No valid queries for comparison")
         return
 
-    for label, mode, alpha in configs:
+    for label, mode, alpha, use_rerank in configs:
         hit_at: dict[int, int] = defaultdict(int)
         for row in valid_queries:
             query = row.get("query", "").strip()
@@ -207,6 +209,7 @@ def _run_compare_table(
                 query, make, model, year, indexes, encoder,
                 mode=mode, dense_topk=args.dense_topk, keyword_topk=args.keyword_topk,
                 alpha=alpha, use_pool_indexes=not args.no_pool, min_pool_docs=50,
+                rerank_topn=args.rerank_topn, use_rerank=use_rerank, reranker=reranker,
             )
             top10 = out[:10] if isinstance(out, list) else out[0][:10]
             for k in k_values:
@@ -216,7 +219,7 @@ def _run_compare_table(
 
     print()
     print("=" * 70)
-    print("Comparison: Recall@K by mode and alpha")
+    print("Comparison: Recall@K by retrieval stage")
     print("=" * 70)
     header = f"{'Config':<14} {'R@1':>6} {'R@3':>6} {'R@5':>6} {'R@10':>6}"
     print(header)
@@ -274,7 +277,26 @@ def main() -> None:
         "--alpha",
         type=float,
         default=0.50,
-        help="Weight for keyword in hybrid: combined = (1-alpha)*dense + alpha*kw_norm",
+        help="Stage-1 hybrid fusion weight: (1-alpha)*dense + alpha*keyword",
+    )
+    parser.add_argument("--rerank", action="store_true", help="Enable stage-2 neural reranking")
+    parser.add_argument(
+        "--rerank-topn",
+        type=int,
+        default=50,
+        help="Number of stage-1 candidates passed to reranker",
+    )
+    parser.add_argument(
+        "--rerank-model",
+        type=str,
+        default="cross-encoder/ms-marco-MiniLM-L-6-v2",
+        help="Cross-encoder model name/path for stage-2 reranking",
+    )
+    parser.add_argument(
+        "--rerank-batch-size",
+        type=int,
+        default=32,
+        help="Batch size for neural reranking",
     )
     parser.add_argument(
         "--alpha-list",
@@ -318,7 +340,7 @@ def main() -> None:
     parser.add_argument(
         "--compare-table",
         action="store_true",
-        help="Run all modes + alpha sweep and print compact comparison table",
+        help="Run dense, keyword, hybrid-only, hybrid+rerank comparison table",
     )
     args = parser.parse_args()
 
@@ -352,7 +374,13 @@ def main() -> None:
         sys.exit(1)
 
     logger.info("Loaded %d eval queries from %s", len(queries), args.eval_file)
-    logger.info("Mode: %s | Alpha(s): %s", args.mode, alpha_values)
+    logger.info(
+        "Mode: %s | Alpha(s): %s | Rerank: %s | Rerank topN: %d",
+        args.mode,
+        alpha_values,
+        args.rerank,
+        args.rerank_topn,
+    )
 
     # Load or build indexes
     indexes = load_faiss_indexes(args.cache_dir)
@@ -375,13 +403,21 @@ def main() -> None:
         logger.error("Failed to load indexes from %s", args.cache_dir)
         sys.exit(1)
 
-    # Load encoder (not needed for keyword-only; required for --compare-table)
+    # Load encoder (not needed for keyword-only unless compare table is requested)
     encoder: SentenceTransformer | None = None
     if args.mode != "keyword" or args.compare_table:
         if not os.path.exists(args.model_dir):
             logger.error("Model not found: %s. Run train_biencoder first.", args.model_dir)
             sys.exit(1)
         encoder = SentenceTransformer(args.model_dir)
+
+    # Load neural reranker when enabled (or for compare table's hybrid+rerank row).
+    reranker: NeuralReranker | None = None
+    if args.rerank or args.compare_table:
+        reranker = NeuralReranker(
+            model_name=args.rerank_model,
+            batch_size=args.rerank_batch_size,
+        )
 
     # Ensure output dir exists
     os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
@@ -395,6 +431,7 @@ def main() -> None:
             queries=queries,
             indexes=indexes,
             encoder=encoder,
+            reranker=reranker,
             args=args,
             k_values=k_values,
         )
@@ -430,17 +467,17 @@ def main() -> None:
                 alpha=alpha,
                 use_pool_indexes=not args.no_pool,
                 min_pool_docs=50,
-                return_score_details=args.show_scores,
+                rerank_topn=args.rerank_topn,
+                use_rerank=args.rerank,
+                reranker=reranker,
+                return_score_details=True,
             )
-            campaign_results: list[dict] = []
-            if args.show_scores:
-                all_campaigns, campaign_results = out
-            else:
-                all_campaigns = out
+            all_campaigns, campaign_results, pre_campaigns = out
 
             top10 = all_campaigns[:topc]
             rank, hit_gold = _best_gold_rank(golds, all_campaigns)
             status = _gold_status(rank, top_k=10)
+            pre_rank, _ = _best_gold_rank(golds, pre_campaigns)
 
             if rank is None:
                 miss_count += 1
@@ -465,6 +502,12 @@ def main() -> None:
                 "gold_in_candidates": rank is not None,
                 "alpha": alpha,
                 "mode": args.mode,
+                "rerank_enabled": args.rerank,
+                "stage1_topn": args.rerank_topn,
+                "before_rerank_top10": pre_campaigns[:10],
+                "after_rerank_top10": top10[:10],
+                "gold_rank_before_rerank": pre_rank,
+                "gold_rank_after_rerank": rank,
             }
             if camp_scores:
                 debug_row["score_diagnostics"] = {
@@ -484,18 +527,24 @@ def main() -> None:
                 for c in top10[:5]:
                     if c not in to_show:
                         to_show.append(c)
-                print("  Scores (dense, keyword, fused):")
+                print("  Scores (dense, keyword, hybrid, rerank):")
                 for cn in to_show:
-                    s = camp_scores.get(cn, {"dense": 0, "keyword": 0, "fused": 0})
+                    s = camp_scores.get(cn, {"dense": 0, "keyword": 0, "hybrid": 0, "rerank": 0})
                     marker = " [GOLD]" if cn in golds else ""
-                    print(f"    {cn}: dense={s['dense']:.4f} kw={s['keyword']:.4f} fused={s['fused']:.4f}{marker}")
+                    print(
+                        f"    {cn}: dense={s['dense']:.4f} kw={s['keyword']:.4f} "
+                        f"hybrid={s['hybrid']:.4f} rerank={s['rerank']:.4f}{marker}"
+                    )
 
         n = len(queries)
 
         # Summary section
         print()
         print("=" * 60)
-        print(f"Summary (mode={args.mode}, alpha={alpha})")
+        print(
+            f"Summary (mode={args.mode}, alpha={alpha}, "
+            f"rerank={args.rerank}, rerank_topn={args.rerank_topn})"
+        )
         print("=" * 60)
         print(f"Total queries: {n}")
         print(f"Gold in top 1:  {hit_at[1]}")

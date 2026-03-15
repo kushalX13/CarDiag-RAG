@@ -9,7 +9,7 @@ from collections import defaultdict
 from sentence_transformers import SentenceTransformer
 
 from .config import DATA_DIR, PROCESSED_DIR
-from .rerank import rerank
+from .rerank import NeuralReranker, build_hybrid_candidates, rerank_candidates
 from .retrieve import (
     build_faiss_indexes,
     keyword_search,
@@ -43,49 +43,56 @@ def _build_query_from_context(make: str, model: str, year: int | None, query_tex
 
 
 def _aggregate_by_campaign_with_scores(
-    results: list[tuple[dict, float, float, float]],
+    results: list[dict],
     make_norm: str | None,
     debug: bool = False,
 ) -> list[dict]:
     """
-    Group by campaign_number, use combined_score for campaign_score.
-    Each result is (doc, combined, dense_score, kw_norm).
-    Evidence includes dense_score, keyword_score (kw_norm), combined.
+    Group by campaign_number and score by best doc in each campaign.
+    Expects each result to include:
+    doc, dense_score, keyword_score, hybrid_score, rerank_score.
     """
     if make_norm:
         results = [
             r for r in results
-            if (r[0].get("make_norm") or "") == make_norm
+            if ((r.get("doc") or {}).get("make_norm") or "") == make_norm
         ]
 
-    by_campaign: dict[str, list[tuple[dict, float, float, float]]] = defaultdict(list)
-    for doc, combined, dense_score, kw_norm in results:
+    by_campaign: dict[str, list[dict]] = defaultdict(list)
+    for row in results:
+        doc = row.get("doc") or {}
         cn = doc.get("campaign_number") or ""
         if not cn.strip():
             continue
-        by_campaign[cn].append((doc, combined, dense_score, kw_norm))
+        by_campaign[cn].append(row)
 
     campaign_results = []
     for cn, items in by_campaign.items():
-        # Per campaign: max(combined) — "a campaign is as good as its best supporting snippet"
-        combined_scores = [s[1] for s in items]  # s[1] = combined
+        # A campaign is as good as its strongest snippet.
+        stage_scores = [x.get("rerank_score", x.get("hybrid_score", 0.0)) for x in items]
         if debug and cn in ("22V406000", "18V332000"):
             print("DEBUG cn", cn, "hits", len(items),
-                  "max_comb", max(combined_scores),
-                  "sum_comb", sum(combined_scores))
-        campaign_score = max(combined_scores)
-        best = max(items, key=lambda x: x[1])  # x[1] = combined
-        best_doc, best_combined, best_dense, best_kw = best
-        sorted_items = sorted(items, key=lambda x: x[1], reverse=True)
+                  "best_stage", max(stage_scores),
+                  "sum_stage", sum(stage_scores))
+        campaign_score = max(stage_scores)
+        best = max(items, key=lambda x: x.get("rerank_score", x.get("hybrid_score", 0.0)))
+        best_doc = best.get("doc") or {}
+        sorted_items = sorted(
+            items,
+            key=lambda x: x.get("rerank_score", x.get("hybrid_score", 0.0)),
+            reverse=True,
+        )
         evidence_snippets = []
-        for doc, combined_s, dense_s, kw_s in sorted_items[:2]:
+        for item in sorted_items[:2]:
+            doc = item.get("doc") or {}
             text = (doc.get("text") or "")[:280]
             evidence_snippets.append({
                 "doc_id": doc.get("doc_id", ""),
                 "snippet": text,
-                "dense_score": dense_s,
-                "keyword_score": kw_s,
-                "combined": combined_s,
+                "dense_score": item.get("dense_score", 0.0),
+                "keyword_score": item.get("keyword_score", 0.0),
+                "hybrid_score": item.get("hybrid_score", 0.0),
+                "rerank_score": item.get("rerank_score", item.get("hybrid_score", 0.0)),
             })
         campaign_results.append({
             "campaign_number": cn,
@@ -135,29 +142,35 @@ def main() -> None:
         "--alpha",
         type=float,
         default=0.50,
-        help="Weight for keyword: combined = (1-alpha)*dense + alpha*kw_norm (default 0.50 for hybrid)",
+        help="Stage-1 hybrid fusion weight: (1-alpha)*dense + alpha*keyword (default 0.50)",
     )
     parser.add_argument(
-        "--rerank-tokens",
-        type=int,
-        default=12,
-        help="Max query tokens for rerank",
-    )
-    parser.add_argument(
-        "--rerank-phrases",
-        type=int,
-        default=10,
-        help="Max phrases for rerank",
-    )
-    parser.add_argument(
-        "--no-rerank",
+        "--rerank",
         action="store_true",
-        help="Disable keyword reranking",
+        help="Enable stage-2 neural reranking over stage-1 candidates",
+    )
+    parser.add_argument(
+        "--rerank-topn",
+        type=int,
+        default=50,
+        help="Number of stage-1 candidates passed to reranker",
+    )
+    parser.add_argument(
+        "--rerank-model",
+        type=str,
+        default="cross-encoder/ms-marco-MiniLM-L-6-v2",
+        help="Cross-encoder model name/path for neural reranking",
+    )
+    parser.add_argument(
+        "--rerank-batch-size",
+        type=int,
+        default=32,
+        help="Batch size for neural reranking",
     )
     parser.add_argument(
         "--show-candidates",
         action="store_true",
-        help="Print candidate doc IDs + snippets before rerank (for debugging recall)",
+        help="Print candidate doc IDs + snippets before stage-2 rerank",
     )
     parser.add_argument(
         "--hybrid",
@@ -221,12 +234,12 @@ def main() -> None:
         sys.exit(1)
     model = SentenceTransformer(args.model_dir)
 
-    # Search: dense only, or hybrid (union of dense + keyword)
+    # Search: dense only, or hybrid (dense + keyword fused with alpha)
     use_hybrid = args.hybrid
-    dense_topk = args.dense_topk if use_hybrid else args.topk
-    keyword_topk = args.keyword_topk if use_hybrid else 0
+    dense_topk = max(args.dense_topk if use_hybrid else args.topk, args.rerank_topn)
+    keyword_topk = max(args.keyword_topk, args.rerank_topn) if use_hybrid else 0
 
-    results = search(
+    dense_results = search(
         search_query,
         make_norm,
         mkey,
@@ -237,9 +250,9 @@ def main() -> None:
         min_pool_docs=50,
     )
 
+    keyword_results: list[tuple[dict, float]] = []
     if use_hybrid and keyword_topk > 0:
-        n_dense = len(results)
-        kw_results = keyword_search(
+        keyword_results = keyword_search(
             query_text,
             make_norm,
             mkey,
@@ -248,58 +261,55 @@ def main() -> None:
             use_pool_indexes=not args.no_pool,
             min_pool_docs=50,
         )
-        n_kw = len(kw_results)
-        # Union: dedupe by doc_id, keep dense score when available
-        seen: dict[str, tuple[dict, float]] = {}
-        for doc, dense_score in results:
-            did = doc.get("doc_id", "")
-            if did and did not in seen:
-                seen[did] = (doc, dense_score)
-        for doc, _ in kw_results:
-            did = doc.get("doc_id", "")
-            if did and did not in seen:
-                seen[did] = (doc, 0.0)  # keyword-only: dense=0
-        results = list(seen.values())
-        logger.info("Hybrid: dense=%d + keyword=%d -> union=%d", n_dense, n_kw, len(results))
+    candidates = build_hybrid_candidates(
+        dense_results,
+        keyword_results,
+        alpha=args.alpha,
+        top_n=args.rerank_topn,
+    )
+    logger.info(
+        "Stage1 hybrid: dense=%d keyword=%d -> candidates=%d (top_n=%d, alpha=%.2f)",
+        len(dense_results),
+        len(keyword_results),
+        len(candidates),
+        args.rerank_topn,
+        args.alpha,
+    )
 
-    if not results:
+    if not candidates:
         logger.info("No results found.")
         sys.exit(0)
 
-    # Debug: print candidates before rerank (confirm if right doc is in set)
+    # Debug: print candidates before stage-2 rerank.
     if args.show_candidates:
-        print("\n--- Candidates (before rerank) ---")
-        for i, (doc, dense_score) in enumerate(results[:30]):
+        print("\n--- Candidates (after stage1 hybrid, before stage2 rerank) ---")
+        for i, item in enumerate(candidates[:30]):
+            doc = item.get("doc") or {}
             cid = doc.get("campaign_number", "")
             did = doc.get("doc_id", "")
             snippet = (doc.get("text", "") or "")[:80].replace("\n", " ")
-            print(f"  {i+1}. {cid} | {did} | {snippet}...")
+            hs = item.get("hybrid_score", 0.0)
+            print(f"  {i+1}. {cid} | {did} | hybrid={hs:.3f} | {snippet}...")
         print("---\n")
 
-    # Keyword rerank: TF-IDF-ish over candidates + phrase matching
-    use_rerank = not args.no_rerank
-    alpha = args.alpha
-    max_tokens = args.rerank_tokens
-    max_phrases = args.rerank_phrases
-
-    if use_rerank:
-        mode = "hybrid" if use_hybrid else "dense-only"
-        logger.info("Rerank: enabled=True mode=%s alpha=%.2f tokens=%d phrases=%d", mode, alpha, max_tokens, max_phrases)
-        results_for_agg = rerank(
-            results,
-            query_text,
-            alpha=alpha,
-            max_tokens=max_tokens,
-            max_phrases=max_phrases,
-            normalize_dense=use_hybrid,
+    reranker = None
+    if args.rerank:
+        reranker = NeuralReranker(
+            model_name=args.rerank_model,
+            batch_size=args.rerank_batch_size,
         )
-    else:
-        logger.info("Rerank: enabled=False")
-        results_for_agg = [(doc, dense_score, dense_score, 0.0) for doc, dense_score in results]
+    ranked_docs = rerank_candidates(
+        query_text,
+        candidates,
+        use_rerank=args.rerank,
+        reranker=reranker,
+        top_k=args.topk,
+    )
+    logger.info("Stage2 rerank: enabled=%s -> final_docs=%d", args.rerank, len(ranked_docs))
 
-    # Aggregate by campaign (use combined: sum + 0.1*max + 0.5*hits)
+    # Aggregate by campaign.
     campaigns = _aggregate_by_campaign_with_scores(
-        results_for_agg,
+        ranked_docs,
         make_norm=make_norm if make_norm else None,
         debug=args.show_candidates,
     )
@@ -312,8 +322,9 @@ def main() -> None:
             snippet = (ev.get("snippet") or "").replace("\n", " ")
             ds = ev.get("dense_score", 0)
             kw = ev.get("keyword_score", 0)
-            comb = ev.get("combined", 0)
-            print(f"  Evidence {j}: {ev.get('doc_id', '')} (dense={ds:.3f} kw={kw:.3f} combined={comb:.3f}) ... {snippet}...")
+            hs = ev.get("hybrid_score", 0)
+            rs = ev.get("rerank_score", hs)
+            print(f"  Evidence {j}: {ev.get('doc_id', '')} (dense={ds:.3f} kw={kw:.3f} hybrid={hs:.3f} rerank={rs:.3f}) ... {snippet}...")
         if i == 0:
             best_text = (camp.get("best_doc", {}).get("text") or "")[:120].replace("\n", " ")
             print()

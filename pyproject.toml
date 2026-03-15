@@ -19,5 +19,8 @@ dependencies = [
     "faiss-cpu>=1.7",
 ]
 
+[project.scripts]
+carrecall-demo = "carrecall_rag.demo_rag:main"
+
 [tool.setuptools.packages.find]
 where = ["src"]
