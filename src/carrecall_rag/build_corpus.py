@@ -9,7 +9,7 @@ import os
 from tqdm import tqdm
 
 from .config import MODELS, PROCESSED_DIR, RAW_COMPLAINTS_DIR, RAW_RECALLS_DIR
-from .nhtsa_api import fetch_complaints, fetch_recalls
+from .nhtsa import fetch_complaints, fetch_recalls
 from .utils import (
     chunk_text,
     extract_best_text_fields,

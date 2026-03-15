@@ -1,12 +1,11 @@
 #!/bin/bash
-# Spot checks: alpha=0.30, hybrid. Run from project root.
-# Uses || true so one failure doesn't kill the whole run.
+# Spot checks (hybrid). Run from project root. Uses || true so one failure doesn't stop the run.
 
 cd "$(dirname "$0")/.." && export PYTHONPATH=src
 
 TOPC=3
 DENSE_TOPK=100
-KW_TOPK=200   # bump keyword coverage for spot-check stability
+KW_TOPK=200
 ALPHA=0.50
 
 COMMON_ARGS="--topc $TOPC --dense-topk $DENSE_TOPK --keyword-topk $KW_TOPK --alpha $ALPHA --hybrid"

@@ -1,4 +1,4 @@
-"""CLI: End-to-end RAG demo — hybrid retrieval + grounded answer generation."""
+"""CLI: hybrid retrieval + template answer."""
 
 import argparse
 import logging
@@ -12,7 +12,7 @@ from .demo_retrieve import (
     _aggregate_by_campaign_with_scores,
     _build_query_from_context,
 )
-from .rag_answer import generate_rag_answer
+from .answer import generate_rag_answer
 from .rerank import NeuralReranker, build_hybrid_candidates, rerank_candidates
 from .retrieve import (
     build_faiss_indexes,
@@ -124,7 +124,6 @@ def main() -> None:
     args = parser.parse_args()
 
     if not args.debug:
-        # Keep demo output clean and user-facing by default.
         logging.getLogger().setLevel(logging.WARNING)
         logging.getLogger("carrecall_rag").setLevel(logging.WARNING)
         logging.getLogger("sentence_transformers").setLevel(logging.WARNING)
@@ -146,7 +145,6 @@ def main() -> None:
 
     search_query = _build_query_from_context(args.make, args.model, args.year, query_text)
 
-    # Load or build indexes
     indexes = load_faiss_indexes(args.cache_dir)
     if not indexes.get("global"):
         logger.info("Indexes not found. Building from corpus...")
@@ -172,7 +170,6 @@ def main() -> None:
         sys.exit(1)
     model = SentenceTransformer(args.model_dir)
 
-    # Stage 1: Hybrid retrieval candidate generation (dense + keyword -> fused top N).
     dense_topk = max(args.dense_topk, args.rerank_topn)
     keyword_topk = max(args.keyword_topk, args.rerank_topn)
     dense_results = search(
@@ -202,15 +199,6 @@ def main() -> None:
         alpha=args.alpha,
         top_n=args.rerank_topn,
     )
-    logger.info(
-        "Stage1 hybrid: dense=%d keyword=%d -> candidates=%d (top_n=%d, alpha=%.2f)",
-        len(dense_results),
-        len(keyword_results),
-        len(candidates),
-        args.rerank_topn,
-        args.alpha,
-    )
-
     if not candidates:
         logger.info("No results found.")
         answer = generate_rag_answer(query_text, [], top_k=args.topk, vehicle=vehicle_label)
@@ -225,7 +213,6 @@ def main() -> None:
                 f.write(final_output.rstrip() + "\n")
         sys.exit(0)
 
-    # Stage 2: Optional neural reranking on stage-1 candidates.
     reranker = None
     if args.rerank:
         reranker = NeuralReranker(
@@ -246,7 +233,6 @@ def main() -> None:
         debug=args.debug,
     )
 
-    # Generate grounded RAG answer
     answer = generate_rag_answer(query_text, campaigns, top_k=args.topk, vehicle=vehicle_label)
     final_output = "\n" + answer
     print(final_output)

@@ -2,7 +2,7 @@
 
 import unittest
 
-from carrecall_rag.rag_answer import generate_rag_answer
+from carrecall_rag.answer import generate_rag_answer
 
 
 def _mk_campaign(

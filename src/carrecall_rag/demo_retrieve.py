@@ -1,4 +1,4 @@
-"""CLI: Demo retrieval with campaign aggregation."""
+"""CLI: retrieval + campaign aggregation (dense/hybrid, optional rerank)."""
 
 import argparse
 import logging
@@ -28,7 +28,6 @@ DEFAULT_CACHE_DIR = os.path.join(DATA_DIR, "indexes")
 
 
 def _build_query_from_context(make: str, model: str, year: int | None, query_text: str) -> str:
-    """Optionally prepend vehicle context to query for better retrieval."""
     if not query_text.strip():
         return query_text
     parts = []
@@ -47,11 +46,7 @@ def _aggregate_by_campaign_with_scores(
     make_norm: str | None,
     debug: bool = False,
 ) -> list[dict]:
-    """
-    Group by campaign_number and score by best doc in each campaign.
-    Expects each result to include:
-    doc, dense_score, keyword_score, hybrid_score, rerank_score.
-    """
+    """Group by campaign_number; score = max(rerank_score or hybrid_score). Expects doc, *_score on each row."""
     if make_norm:
         results = [
             r for r in results
@@ -68,7 +63,6 @@ def _aggregate_by_campaign_with_scores(
 
     campaign_results = []
     for cn, items in by_campaign.items():
-        # A campaign is as good as its strongest snippet.
         stage_scores = [x.get("rerank_score", x.get("hybrid_score", 0.0)) for x in items]
         if debug and cn in ("22V406000", "18V332000"):
             print("DEBUG cn", cn, "hits", len(items),
@@ -305,9 +299,6 @@ def main() -> None:
         reranker=reranker,
         top_k=args.topk,
     )
-    logger.info("Stage2 rerank: enabled=%s -> final_docs=%d", args.rerank, len(ranked_docs))
-
-    # Aggregate by campaign.
     campaigns = _aggregate_by_campaign_with_scores(
         ranked_docs,
         make_norm=make_norm if make_norm else None,

@@ -1,1 +1,1 @@
-"""CarRecall-RAG: NHTSA complaints and recalls retrieval baseline."""
+"""NHTSA recall retrieval: hybrid dense + BM25, optional rerank."""

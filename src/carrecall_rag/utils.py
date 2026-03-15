@@ -1,4 +1,4 @@
-"""Utility functions for CarRecall-RAG."""
+"""Normalize make/model, chunk text, JSONL write."""
 
 import hashlib
 import json
@@ -9,7 +9,7 @@ def safe_slug(text: str) -> str:
     """Normalize text for filenames: lowercase, replace spaces/slashes with underscores."""
     s = text.lower().strip()
     s = re.sub(r"[\s/]+", "_", s)
-    s = re.sub(r"[^\w\-_.]", "", s)  # keep alphanumeric, underscore, hyphen, dot
+    s = re.sub(r"[^\w\-_.]", "", s)
     return s or "unknown"
 
 
@@ -58,7 +58,6 @@ def extract_best_text_fields(record: dict, field_candidates: list[str]) -> str:
     return " ".join(parts) if parts else ""
 
 
-# Make synonyms: normalized form -> canonical
 MAKE_SYNONYMS = {
     "MERCEDESBENZ": "MERCEDES-BENZ",
     "MERCEDES BENZ": "MERCEDES-BENZ",
@@ -82,7 +81,6 @@ def normalize_model(s: str) -> str:
     t = s.upper().strip()
     t = t.replace("-", " ")
     t = " ".join(t.split())  # collapse spaces
-    # Strip trim words like 4DR, 2DR, SEDAN, COUPE, etc.
     trim_words = {"4DR", "2DR", "4D", "2D", "SEDAN", "COUPE", "HATCHBACK", "WAGON", "SUV", "PICKUP"}
     words = t.split()
     words = [w for w in words if w not in trim_words]

@@ -1,4 +1,4 @@
-"""NHTSA API client for complaints and recalls. Uses requests, no scraping."""
+"""NHTSA API client (complaints, recalls)."""
 
 import json
 import logging

@@ -20,7 +20,7 @@ dependencies = [
 ]
 
 [project.scripts]
-carrecall-demo = "carrecall_rag.demo_rag:main"
+carrecall-demo = "carrecall_rag.demo:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

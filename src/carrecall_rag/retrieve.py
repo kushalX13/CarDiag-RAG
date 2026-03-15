@@ -1,4 +1,4 @@
-"""Retrieval module: FAISS indexes, search, keyword search, and campaign aggregation."""
+"""FAISS + BM25 search, index build/load, campaign aggregation."""
 
 import json
 import logging
@@ -16,7 +16,6 @@ from .utils import model_key as compute_model_key, normalize_make
 
 
 def _bm25_tokenize(text: str) -> list[str]:
-    """Lowercase, split on non-alphanum."""
     text = (text or "").lower()
     return re.findall(r"[a-z0-9]+", text)
 
@@ -24,7 +23,6 @@ logger = logging.getLogger(__name__)
 
 
 def load_corpus(path: str = "data/processed/corpus_merged.jsonl") -> list[dict]:
-    """Load corpus from JSONL. Each doc has doc_id, campaign_number, make_norm, model_key, text, plus any fields."""
     docs = []
     with open(path, "r", encoding="utf-8") as f:
         for line in f:
@@ -41,15 +39,7 @@ def build_faiss_indexes(
     min_pool_docs: int = 50,
     cache_dir: str = "data/indexes/",
 ) -> None:
-    """
-    Build and save FAISS indexes:
-    a) one global index (optional)
-    b) per-(make_norm, model_key) pool indexes
-    c) make-only fallback indexes
-
-    Saves: faiss index file(s) and JSON mapping from index row -> doc_id (and campaign_number).
-    Uses cosine similarity (L2-normalize embeddings, IndexFlatIP).
-    """
+    """Build global + optional pool/make FAISS indexes; save .faiss + mapping JSON."""
     os.makedirs(cache_dir, exist_ok=True)
     model = SentenceTransformer(model_dir)
 
@@ -59,7 +49,6 @@ def build_faiss_indexes(
     embeddings = np.asarray(embeddings, dtype=np.float32)
 
     def _save_index(name: str, indices: list[int]) -> None:
-        """Save FAISS index and mapping for given doc indices."""
         if not indices:
             return
         sub_emb = embeddings[indices]
@@ -77,14 +66,12 @@ def build_faiss_indexes(
             json.dump({"mapping": mapping_light, "docs": mapping}, f, ensure_ascii=False)
         logger.info("Saved %s: %d docs", name, len(indices))
 
-    # a) Global index
     global_indices = list(range(len(corpus_docs)))
     _save_index("global", global_indices)
 
     if not use_pool_indexes:
         return
 
-    # b) Per (make_norm, model_key) pool indexes
     pool_groups: dict[tuple[str, str], list[int]] = defaultdict(list)
     for i, doc in enumerate(corpus_docs):
         make_norm = doc.get("make_norm") or ""
@@ -96,7 +83,6 @@ def build_faiss_indexes(
             pool_key = f"pool_{make_norm}_{mkey}"
             _save_index(pool_key, indices)
 
-    # c) Make-only fallback indexes
     make_groups: dict[str, list[int]] = defaultdict(list)
     for i, doc in enumerate(corpus_docs):
         make_norm = doc.get("make_norm") or ""
@@ -109,15 +95,8 @@ def build_faiss_indexes(
 
 
 def load_faiss_indexes(cache_dir: str = "data/indexes/") -> dict:
-    """
-    Load FAISS indexes and mappings from cache_dir.
-    Returns dict with keys: "global", "pools", "makes".
-    Each index entry has: index (faiss.Index), mapping (list of {doc_id, campaign_number}), docs (full doc list).
-    """
+    """Load .faiss indexes and _mapping.json from cache_dir. Keys: global, pools, makes."""
     cache_path = Path(cache_dir).resolve()
-    logger.info(f"Loading indexes from: {cache_dir} (abs: {cache_path})")
-    logger.info(f"Exists? {cache_path.exists()}  | files: {len(list(cache_path.glob('*'))) if cache_path.exists() else 0}")
-    logger.info(f"Sample files: {[p.name for p in list(cache_path.glob('*'))[:20]] if cache_path.exists() else []}")
 
     indexes = {}
     mappings = {}
@@ -127,8 +106,6 @@ def load_faiss_indexes(cache_dir: str = "data/indexes/") -> dict:
         return {"global": None, "pools": {}, "makes": {}}
 
     faiss_files = list(cache_path.glob("*.faiss"))
-    logger.info(f"Found %d .faiss files", len(faiss_files))
-
     for faiss_path in faiss_files:
         key = faiss_path.stem  # e.g. "pool_FORD_f150", "global"
         map_path = cache_path / f"{key}_mapping.json"
@@ -144,9 +121,6 @@ def load_faiss_indexes(cache_dir: str = "data/indexes/") -> dict:
         indexes[key] = index
         mappings[key] = mapping_data
 
-    logger.info(f"Loaded index keys: {sorted(indexes.keys())}")
-
-    # Build result structure for select_index/search (pools, makes, global)
     result = {"global": None, "pools": {}, "makes": {}}
     for key in indexes:
         mapping_data = mappings[key]
@@ -173,16 +147,7 @@ def select_index(
     global_entry: dict | None,
     min_pool_docs: int = 50,
 ) -> tuple[dict, str, str]:
-    """
-    Select which index to use for search. Returns (entry, index_name, index_type).
-
-    Selection:
-    1) pool_key exists AND pools[pool_key].index.ntotal >= min_pool_docs -> pool
-    2) make_key exists AND make_only[make_key].index.ntotal >= min_pool_docs -> make
-    3) else -> global
-
-    model_key must be lower alphanumeric (e.g. "F-150" -> "f150").
-    """
+    """Prefer pool → make → global when ntotal >= min_pool_docs. Returns (entry, index_name, index_type)."""
     pool_key = f"pool_{make_norm}_{model_key}"
     make_key = f"make_{make_norm}"
 
@@ -214,11 +179,7 @@ def search(
     use_pool_indexes: bool = True,
     min_pool_docs: int = 50,
 ) -> list[tuple[dict, float]]:
-    """
-    Search for relevant docs. Uses select_index for STRICT index selection.
-    Returns list of (doc, score) sorted by score desc.
-    """
-    # Ensure normalization matches corpus/build: make_norm ("Ford"->"FORD"), model_key ("F-150"->"f150")
+    """Dense search via select_index. Returns (doc, score) sorted by score desc."""
     make_norm = normalize_make(make_norm) if make_norm else ""
     model_key = compute_model_key(model_key) if model_key else ""
 
@@ -238,9 +199,6 @@ def search(
 
     if entry is None:
         return []
-
-    ntotal = entry["index"].ntotal
-    logger.info("Selected index: %s (%d docs) [%s]", index_name, ntotal, index_type)
 
     faiss_index = entry["index"]
     docs = entry["docs"]
@@ -269,10 +227,7 @@ def keyword_search(
     use_pool_indexes: bool = True,
     min_pool_docs: int = 50,
 ) -> list[tuple[dict, float]]:
-    """
-    BM25 keyword search over the same index as search (pool/make/global).
-    Returns [(doc, bm25_score), ...] sorted by score desc.
-    """
+    """BM25 over same index as search. Returns [(doc, score), ...] desc."""
     make_norm = normalize_make(make_norm) if make_norm else ""
     model_key = compute_model_key(model_key) if model_key else ""
 
@@ -308,21 +263,7 @@ def aggregate_by_campaign(
     results: list[tuple[dict, float]],
     make_norm: str | None = None,
 ) -> list[dict]:
-    """
-    Group by campaign_number and compute:
-      campaign_score = sum(scores) + 0.2*max(scores) + 0.5*count
-
-    If make_norm is provided: drop cross-make docs (doc.make_norm != make_norm).
-    This prevents wrong-make campaigns from ranking when user specified a vehicle.
-
-    For each campaign store:
-      - campaign_number
-      - campaign_score
-      - best_doc (highest score)
-      - evidence_snippets: top 2 docs (doc_id + first 280 chars)
-
-    Sort campaigns by campaign_score desc.
-    """
+    """Group by campaign_number; score = sum + 0.2*max + 0.5*count. Filter by make_norm if set. Sorted desc."""
     if make_norm:
         results = [(doc, s) for doc, s in results if (doc.get("make_norm") or "") == make_norm]
 

@@ -13,7 +13,7 @@ TOPC=10
 ALPHA=0.50
 MODE="${MODE:-hybrid}"
 
-python -m carrecall_rag.eval_retrieval \
+python -m carrecall_rag.eval \
   --eval-file "$EVAL_FILE" \
   --dense-topk $DENSE_TOPK \
   --keyword-topk $KW_TOPK \

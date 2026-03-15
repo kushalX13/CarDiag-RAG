@@ -1,4 +1,4 @@
-"""Evaluation pipeline: Recall@K metrics over a labeled test set."""
+"""Recall@K, MRR, per-query JSONL over labeled queries."""
 
 import argparse
 import json
@@ -56,17 +56,12 @@ def run_retrieval(
     rerank_text_format: str = "full",
     return_score_details: bool = False,
 ) -> list[str] | tuple[list[str], list[dict], list[str], list[dict], list[dict]]:
-    """
-    Run retrieval pipeline: search (dense/keyword/hybrid) -> rerank -> aggregate.
-    Returns list of campaign_numbers in rank order (top first).
-    mode: "dense" | "keyword" | "hybrid"
-    """
+    """Run search (dense/keyword/hybrid) -> optional rerank -> aggregate. Returns campaign_numbers in rank order."""
     make_norm = normalize_make(make) if make else ""
     mkey = model_key(model) if model else ""
 
     search_query = _build_query_from_context(make, model, year, query_text)
 
-    # Stage 1 retrieval sources
     if mode == "keyword":
         dense_results = []
     else:

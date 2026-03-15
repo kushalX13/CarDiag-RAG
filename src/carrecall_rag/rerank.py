@@ -1,4 +1,4 @@
-"""Hybrid candidate fusion + optional neural reranking."""
+"""Fusion of dense + keyword; optional cross-encoder rerank."""
 
 from __future__ import annotations
 
@@ -28,7 +28,6 @@ BOILERPLATE_PATTERNS = [
 
 
 def _first_sentence(text: str, max_chars: int = 180) -> str:
-    """Best-effort first sentence extraction."""
     text = (text or "").strip()
     if not text:
         return ""
@@ -39,7 +38,6 @@ def _first_sentence(text: str, max_chars: int = 180) -> str:
 
 
 def _extract_consequence(text: str, max_chars: int = 220) -> str:
-    """Extract a likely consequence phrase from free text."""
     t = (text or "").strip()
     if not t:
         return ""
@@ -56,12 +54,10 @@ def _extract_consequence(text: str, max_chars: int = 220) -> str:
 
 
 def _tokenize(text: str) -> list[str]:
-    """Tokenize text to lowercase alphanumeric terms."""
     return re.findall(r"[a-z0-9]+", (text or "").lower())
 
 
 def _is_boilerplate_sentence(sentence: str) -> bool:
-    """Heuristic boilerplate detector for low-signal recall prose."""
     s = (sentence or "").strip().lower()
     if not s:
         return True
@@ -76,7 +72,6 @@ def _is_boilerplate_sentence(sentence: str) -> bool:
 
 
 def _is_informative_title(title: str) -> bool:
-    """Reject generic/non-informative titles."""
     t = " ".join((title or "").split()).strip()
     if len(t) < 12:
         return False
@@ -93,7 +88,6 @@ def _is_informative_title(title: str) -> bool:
 
 
 def _split_sentences(text: str) -> list[str]:
-    """Split by sentence punctuation/newlines."""
     if not text:
         return []
     raw = re.split(r"(?<=[.!?])\s+|\n+", text)
@@ -101,7 +95,6 @@ def _split_sentences(text: str) -> list[str]:
 
 
 def _sentence_relevance_score(sentence: str, query_terms: set[str]) -> float:
-    """Score sentence by query overlap + issue vocab overlap."""
     toks = set(_tokenize(sentence))
     if not toks:
         return 0.0
@@ -112,7 +105,6 @@ def _sentence_relevance_score(sentence: str, query_terms: set[str]) -> float:
 
 
 def _top_relevant_sentences(text: str, query: str, top_k: int = 3) -> tuple[list[str], int]:
-    """Return top relevant non-boilerplate sentences and count of removed boilerplate."""
     q_terms = set(_tokenize(query)) | IMPORTANT_ISSUE_TERMS
     sents = _split_sentences(text)
     filtered = []
@@ -129,7 +121,6 @@ def _top_relevant_sentences(text: str, query: str, top_k: int = 3) -> tuple[list
 
 
 def _best_defect_text(doc: dict, text: str, query: str) -> tuple[str, str]:
-    """Pick defect/summary from explicit fields or relevant sentence."""
     for key in ("defect", "summary", "description"):
         val = (doc.get(key) or "").strip()
         if val and not _is_boilerplate_sentence(val):
@@ -141,7 +132,6 @@ def _best_defect_text(doc: dict, text: str, query: str) -> tuple[str, str]:
 
 
 def _chunk_selection_text(doc: dict) -> str:
-    """Text used for chunk-level query relevance scoring."""
     parts = [
         doc.get("title", ""),
         doc.get("summary", ""),
@@ -154,7 +144,6 @@ def _chunk_selection_text(doc: dict) -> str:
 
 
 def _phrase_hits(query: str, text: str) -> list[str]:
-    """Important phrase matches to bias chunk selection."""
     q = (query or "").lower()
     t = (text or "").lower()
     phrases = [
@@ -179,9 +168,6 @@ def _select_campaign_evidence_chunks(
     *,
     max_chunks: int = 3,
 ) -> dict[str, dict]:
-    """
-    Score all chunks within each campaign and select top query-relevant evidence.
-    """
     by_campaign: dict[str, list[dict]] = {}
     q_terms = set(_tokenize(query))
     for row in rows:
@@ -241,14 +227,7 @@ def _build_rerank_text(
     text_format: str = "full",
     campaign_context: dict | None = None,
 ) -> tuple[str, dict]:
-    """
-    Build reranker input text and expose exact source fields used.
-
-    text_format:
-      - full: doc.text
-      - compact: title + component + consequence
-      - smart: campaign + informative fields + top relevant sentences
-    """
+    """Build reranker input: full=doc.text, compact=title+component+consequence, smart=selected evidence."""
     context_rows = (campaign_context or {}).get("chosen_rows") or []
     if text_format == "smart" and context_rows:
         context_text = "\n".join(_chunk_selection_text((r.get("doc") or {})) for r in context_rows)
@@ -315,7 +294,6 @@ def _build_rerank_text(
 
     if text_format == "smart":
         if context_rows:
-            # Use campaign-level evidence-selected chunks instead of arbitrary chunk text.
             context_doc0 = (context_rows[0].get("doc") or {})
             if not component:
                 component = (context_doc0.get("component") or "").strip()
@@ -380,7 +358,6 @@ def _build_rerank_text(
 
 
 def _minmax_normalize(scores: list[float]) -> list[float]:
-    """Map a score list to [0,1] with safe degenerate handling."""
     if not scores:
         return []
     s_min = min(scores)
@@ -398,21 +375,7 @@ def build_hybrid_candidates(
     alpha: float = 0.50,
     top_n: int = 50,
 ) -> list[dict]:
-    """
-    Build stage-1 candidates from dense + keyword retrieval.
-
-    Returns a list of candidate dicts sorted by `hybrid_score` desc:
-    {
-      "doc": doc,
-      "doc_id": ...,
-      "campaign_number": ...,
-      "dense_raw": ...,
-      "keyword_raw": ...,
-      "dense_score": ...,
-      "keyword_score": ...,
-      "hybrid_score": ...
-    }
-    """
+    """Merge dense + keyword; minmax norm then (1-alpha)*dense + alpha*keyword. Sorted by hybrid_score desc."""
     merged: dict[str, dict] = {}
 
     for doc, dense_raw in dense_results:
@@ -463,7 +426,6 @@ def build_hybrid_candidates(
 
 
 class NeuralReranker:
-    """Thin wrapper around a sentence-transformers CrossEncoder."""
 
     def __init__(
         self,
@@ -490,7 +452,6 @@ class NeuralReranker:
         return self._model
 
     def score(self, query: str, docs: list[str]) -> list[float]:
-        """Score query-doc pairs. Higher means more relevant."""
         if not docs:
             return []
         model = self._load()
@@ -509,11 +470,7 @@ def rerank_candidates(
     text_format: str = "full",
     top_k: int | None = None,
 ) -> list[dict]:
-    """
-    Stage-2 reranking for stage-1 hybrid candidates.
-
-    If rerank is disabled, this keeps stage-1 order and sets rerank_score=hybrid_score.
-    """
+    """Optionally rerank stage-1 candidates; else keep order and rerank_score=hybrid_score."""
     if not candidates:
         return []
 
@@ -571,12 +528,7 @@ def rerank(
     max_phrases: int = 10,
     normalize_dense: bool = False,
 ) -> list[tuple[dict, float, float, float]]:
-    """
-    Backward-compatible adapter for older callers.
-
-    This now delegates to stage-1 hybrid fusion and returns:
-    [(doc, combined, dense_score_norm, keyword_score_norm), ...]
-    """
+    """Legacy: hybrid fusion only, returns (doc, combined, dense_norm, keyword_norm)."""
     del query, max_tokens, max_phrases, normalize_dense
     candidates = build_hybrid_candidates(results, [], alpha=alpha, top_n=0)
     return [
