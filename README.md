@@ -2,7 +2,7 @@
 
 [GitHub](https://github.com/kushalX13/CarDiag-RAG)
 
-**CarDiag-RAG** is a hybrid retrieval system that maps free-text vehicle symptom descriptions—plus make/model/year context—to likely NHTSA recall campaigns. It treats symptom-to-recall matching as a **ranking problem**: given a user query, the system returns a ranked list of recall campaigns with optional grounded explanations, and is evaluated with retrieval metrics (Recall@K, MRR), not classification accuracy. The pipeline combines dense retrieval (SentenceTransformer + FAISS), BM25 keyword retrieval, score fusion, campaign-level aggregation, and an optional cross-encoder reranker.
+**CarDiag-RAG** is a hybrid retrieval system that maps free-text vehicle symptom descriptions—plus make/model/year context—to likely NHTSA recall campaigns. Symptom-to-recall matching is treated as a **ranking problem**: the system returns a ranked list of recall campaigns with optional grounded explanations and is evaluated with retrieval metrics (Recall@K, MRR). The pipeline combines dense retrieval (SentenceTransformer + FAISS), BM25 keyword retrieval, score fusion, campaign-level aggregation, and an optional cross-encoder reranker.
 
 ---
 
@@ -16,6 +16,9 @@
 | Eval set   | 10 queries |
 
 Baseline: hybrid retrieval (α=0.5), no rerank. Test set: `eval/recall_queries.jsonl`.
+Both benchmark sets are versioned in git:
+- `eval/recall_queries.jsonl` (original 10-query benchmark)
+- `eval/recall_queries_100_fixed.jsonl` (extended cleaned benchmark derived from the original ~100-query generation pipeline)
 
 **Reproducibility** — Python 3.10+. From project root (with corpus and indexes in place):
 
@@ -107,9 +110,13 @@ carrecall-demo --make Jeep --model "Grand Cherokee" --query "fuel starvation HPF
 |------|---------|
 | **Demo** (hybrid) | `carrecall-demo --make Jeep --model "Grand Cherokee" --query "fuel starvation HPFP failure"` |
 | **Demo + rerank** | Add `--rerank --rerank-topn 50` to the above |
-| **Eval** (full) | `python -m carrecall_rag.eval --eval-file eval/recall_queries.jsonl --output eval/results/retrieval_debug.jsonl --mode hybrid --alpha 0.5 --dense-topk 100 --keyword-topk 150 --topc 10` |
+| **Eval** (small 10-query benchmark) | `python -m carrecall_rag.eval --eval-file eval/recall_queries.jsonl --output eval/results/retrieval_debug.jsonl --mode hybrid --alpha 0.5 --dense-topk 100 --keyword-topk 150 --topc 10` |
 | **Eval** (script) | `./scripts/run_eval.sh` |
-| **Compare modes** | `python -m carrecall_rag.eval --eval-file eval/recall_queries.jsonl --compare-table --dense-topk 100 --keyword-topk 150 --rerank-topn 50` |
+| **Compare rerank formats** | `python -m carrecall_rag.eval --eval-file eval/recall_queries.jsonl --compare-table --dense-topk 100 --keyword-topk 150 --rerank-topn 50` |
+| **Compare methods** (dense/keyword/hybrid/rerank) | `python -m carrecall_rag.eval --eval-file eval/recall_queries.jsonl --compare-methods --compare-methods-output eval/results/comparison_methods.md` |
+| **Eval** (extended fixed benchmark) | `python -m carrecall_rag.eval --eval-file eval/recall_queries_100_fixed.jsonl --output eval/results/retrieval_debug_100_fixed.jsonl` |
+| **Eval** (hard benchmark) | `python -m carrecall_rag.eval --eval-file eval/recall_queries_hard.jsonl --output eval/results/retrieval_debug_hard.jsonl` |
+| **Failure analysis** | `python scripts/analyze_failures.py --input eval/results/retrieval_debug.jsonl --output-dir eval/results` |
 
 Copy-paste:
 
@@ -126,9 +133,21 @@ python -m carrecall_rag.eval \
   --output eval/results/retrieval_debug.jsonl \
   --mode hybrid --alpha 0.5 --dense-topk 100 --keyword-topk 150 --topc 10
 
-# Compare dense vs keyword vs hybrid vs hybrid+rerank
+# Compare rerank text formats (no-rerank, full, compact, smart)
 python -m carrecall_rag.eval --eval-file eval/recall_queries.jsonl --compare-table \
   --dense-topk 100 --keyword-topk 150 --rerank-topn 50
+
+# Compare retrieval methods (dense, keyword, hybrid, hybrid+rerank) — writes eval/results/comparison_methods.md
+python -m carrecall_rag.eval --eval-file eval/recall_queries.jsonl --compare-methods
+
+# Run evaluation on the extended fixed benchmark
+python -m carrecall_rag.eval --eval-file eval/recall_queries_100_fixed.jsonl --output eval/results/retrieval_debug_100_fixed.jsonl
+
+# Run evaluation on the hard benchmark
+python -m carrecall_rag.eval --eval-file eval/recall_queries_hard.jsonl --output eval/results/retrieval_debug_hard.jsonl
+
+# Analyze failures from debug JSONL (after running eval)
+python scripts/analyze_failures.py --input eval/results/retrieval_debug.jsonl
 ```
 
 ---
@@ -136,15 +155,45 @@ python -m carrecall_rag.eval --eval-file eval/recall_queries.jsonl --compare-tab
 ## Evaluation
 
 - **Metrics:** Recall@1, @3, @5, @10 · MRR · avg/median rank · miss count  
-- **Test set:** `eval/recall_queries.jsonl` (fields: `query`, `make`, `model`, `gold_campaign` or `gold_campaigns`)  
-- **Output:** Per-query JSONL and logs under `eval/results/`
+- **Test sets:**  
+  - **Small (default):** `eval/recall_queries.jsonl` — 10 labeled queries.  
+  - **Extended fixed:** `eval/recall_queries_100_fixed.jsonl` — cleaned extended benchmark (in git).  
+  - **Hard:** `eval/recall_queries_hard.jsonl` — challenging paraphrased complaint-style benchmark (in git).  
+- **Fields per query:** `query`, `make`, `model`, `gold_campaign` or `gold_campaigns`.  
+- **Output:** Per-query debug JSONL and logs under `eval/results/`.
 
 | Metric   | Meaning |
 |----------|---------|
 | Recall@K | Fraction of queries where a gold campaign appears in top-K |
 | MRR      | Mean of 1/rank for first correct (0 if none in list) |
 
-**Baseline** (hybrid α=0.5, no rerank): **Recall@1 0.90** · **Recall@10 1.00** · **MRR 0.95** (n=10).
+**Baseline** (hybrid α=0.5, no rerank, small set): **Recall@1 0.90** · **Recall@10 1.00** · **MRR 0.95** (n=10).
+
+**Extended fixed benchmark:** evaluate directly:
+
+```bash
+python -m carrecall_rag.eval --eval-file eval/recall_queries_100_fixed.jsonl --output eval/results/retrieval_debug_100_fixed.jsonl
+```
+
+**Hard benchmark:** evaluate directly:
+
+```bash
+python -m carrecall_rag.eval --eval-file eval/recall_queries_hard.jsonl --output eval/results/retrieval_debug_hard.jsonl
+```
+
+**Method comparison** (dense vs keyword vs hybrid vs hybrid+rerank) with Recall@K, MRR, avg/median rank, miss count:
+
+```bash
+python -m carrecall_rag.eval --eval-file eval/recall_queries.jsonl --compare-methods --compare-methods-output eval/results/comparison_methods.md
+```
+
+**Failure / error analysis:** After running eval, inspect missed or low-ranked queries:
+
+```bash
+python scripts/analyze_failures.py --input eval/results/retrieval_debug.jsonl --output-dir eval/results
+```
+
+This produces `eval/results/failure_analysis.md` and `failure_analysis.csv` with failures, gold campaign, top returned campaigns, first correct rank, and heuristic categories (e.g. symptom wording mismatch, weak lexical overlap).
 
 ---
 
@@ -180,9 +229,9 @@ python -m carrecall_rag.eval --eval-file eval/recall_queries.jsonl --compare-tab
 
 ## Layout
 
-- **`src/carrecall_rag/`** — config, retrieve (FAISS+BM25), rerank (fusion + optional reranker), demo (CLI), answer (template output), eval, build_corpus, nhtsa, utils.  
-- **`eval/`** — recall_queries.jsonl, results/.  
-- **`scripts/`** — run_eval.sh, spot_checks.sh.
+- **`src/carrecall_rag/`** — config, retrieve (FAISS+BM25), rerank (fusion + optional reranker), demo (CLI), answer (template output), eval, generate_eval_queries, build_corpus, nhtsa, utils.  
+- **`eval/`** — recall_queries.jsonl, recall_queries_100_fixed.jsonl, recall_queries_hard.jsonl, results/.
+- **`scripts/`** — run_eval.sh, spot_checks.sh, analyze_failures.py.
 
 ---
 
