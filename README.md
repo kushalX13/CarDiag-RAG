@@ -8,12 +8,23 @@
 
 ## Results snapshot
 
+### Small benchmark (`eval/recall_queries.jsonl`)
+
 | Metric      | Value   |
 |------------|---------|
 | Recall@1   | 0.90    |
 | Recall@10  | 1.00    |
 | MRR        | 0.95    |
 | Eval set   | 10 queries |
+
+### Extended fixed benchmark (`eval/recall_queries_100_fixed.jsonl`)
+
+| Metric      | Value   |
+|------------|---------|
+| Recall@1   | 0.94    |
+| Recall@10  | 1.00    |
+| MRR        | 0.9671  |
+| Eval set   | 81 queries |
 
 Baseline: hybrid retrieval (α=0.5), no rerank. Test set: `eval/recall_queries.jsonl`.
 Both benchmark sets are versioned in git:
