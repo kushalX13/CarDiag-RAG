@@ -1,5 +1,5 @@
 #!/bin/bash
-# Run rerank tests on cluster. Execute from project root.
+# Run rerank tests. Execute from project root.
 
 set -e
 # Run from project root: ./scripts/run_rerank_tests.sh

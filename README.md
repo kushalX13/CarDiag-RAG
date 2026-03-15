@@ -17,13 +17,23 @@
 
 Baseline: hybrid retrieval (α=0.5), no rerank. Test set: `eval/recall_queries.jsonl`.
 
-**Reproducibility** — Python 3.10+. From project root (with corpus and indexes in place, see [Install](#install) and Layout):
+**Reproducibility** — Python 3.10+. From project root (with corpus and indexes in place):
 
 ```bash
 pip install -e . && ./scripts/run_eval.sh
 ```
 
-The script prints Recall@1, Recall@10, and MRR in the **CV-ready metrics** block at the end. To regenerate corpus/indexes from scratch, run the corpus build and index build steps (see `src/carrecall_rag/build_corpus.py`, `retrieve.py`).
+The script prints Recall@1, Recall@10, and MRR in the **CV-ready metrics** block at the end.
+
+**Not in the repo (regenerate after clone or when moving off a machine):** The `data/` directory is gitignored. You need:
+
+| What | Where | How to create |
+|------|--------|----------------|
+| Processed corpus | `data/processed/corpus_merged.jsonl` | `python -m carrecall_rag.build_corpus` (fetches NHTSA; optional: `build_corpus_global` then re-run merge step in build_corpus) |
+| FAISS + BM25 indexes | `data/indexes/*.faiss`, `*_mapping.json` | Built automatically by demo/eval if missing, using corpus + model |
+| Encoder model | `data/models/biencoder/` | Train: `python -m carrecall_rag.train_biencoder` (needs `data/processed/train_triples.jsonl` from `build_triples`). Or copy a SentenceTransformer model (e.g. `sentence-transformers/all-MiniLM-L6-v2`) into this path. |
+
+So after a fresh clone: install deps, then run `build_corpus` (and optionally `build_corpus_global`), put a model in `data/models/biencoder/`, then run demo or eval; indexes will be built on first run if absent.
 
 ---
 
