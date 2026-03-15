@@ -1,5 +1,7 @@
 # CarDiag-RAG
 
+**[GitHub](https://github.com/kushalX13/CarDiag-RAG)**
+
 **CarDiag-RAG** is a retrieval system that maps natural-language vehicle failure symptoms to relevant NHTSA recall campaigns. It uses hybrid retrieval (dense + lexical) over a recall-text corpus, with optional neural reranking for analysis. This is a **retrieval** system: we evaluate with retrieval metrics (Recall@K, MRR, rank statistics), not precision/F1 or classification accuracy.
 
 ---
@@ -122,11 +124,11 @@ Baseline: **hybrid retrieval** (α = 0.5), no rerank. Evaluated on the queries i
 
 | Metric | Value |
 |--------|-------|
-| Evaluated queries (n) | 10 |
-| Recall@1 | 1.00 |
+| Queries evaluated (n) | 10 |
+| Recall@1 | 0.90 |
 | Recall@10 | 1.00 |
-| MRR | 1.00 |
-| Miss count | 0 |
+| MRR | 0.95 |
+| Avg first correct rank | 1.10 |
 
 *To refresh with your latest run: execute the eval command below and copy the **CV-ready metrics** block from the console (Recall@1, Recall@10, MRR, n). If your eval file or run has a different number of evaluated queries, replace the table above with those numbers and leave no placeholders.*
 
@@ -256,7 +258,7 @@ NHTSA public APIs (no scraping):
 ## Installation
 
 ```bash
-git clone <repo-url>
+git clone https://github.com/kushalX13/CarDiag-RAG
 cd CarDiag-RAG
 python3 -m venv .venv
 source .venv/bin/activate   # or: conda activate <env>
